@@ -264,13 +264,13 @@ class DeviceConfig(Vertical):
                     capture_output=True, text=True, timeout=5,
                 )
 
-                # Set time via D-Bus (polkit handles authorization, no sudo)
+                # Set time via D-Bus (absolute UTC usec, allow polkit)
                 result = subprocess.run(
                     [
                         "busctl", "call", "org.freedesktop.timedate1",
                         "/org/freedesktop/timedate1",
                         "org.freedesktop.timedate1",
-                        "SetTime", "xbb", str(usec), "true", "false",
+                        "SetTime", "xbb", str(usec), "false", "true",
                     ],
                     capture_output=True, text=True, timeout=10,
                 )
@@ -279,7 +279,9 @@ class DeviceConfig(Vertical):
                     output = f"System clock set to: {gps_time}"
                 else:
                     # D-Bus failed, try timedatectl set-time as fallback
-                    formatted = dt.strftime("%Y-%m-%d %H:%M:%S")
+                    # timedatectl expects LOCAL time, so convert from UTC
+                    local_dt = dt.astimezone()
+                    formatted = local_dt.strftime("%Y-%m-%d %H:%M:%S")
                     result = subprocess.run(
                         ["timedatectl", "set-time", formatted],
                         capture_output=True, text=True, timeout=10,
