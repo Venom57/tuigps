@@ -6,7 +6,7 @@ import webbrowser
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Grid, Vertical
+from textual.containers import Grid, Horizontal, Vertical
 from textual.widgets import Button, Header, TabbedContent, TabPane
 
 from .clock_sync import set_clock_from_gps
@@ -84,6 +84,9 @@ class TuiGPS(App):
             with TabPane("Timing", id="tab-timing"):
                 with Vertical(id="timing-container"):
                     yield TimePanel(id="w-time-detail", show_pps=True)
+                    with Horizontal(id="toff-controls"):
+                        yield Button("Arm TOFF (20 samples)", id="btn-arm-toff", variant="warning")
+                        yield Button("Clear TOFF", id="btn-clear-toff", variant="default")
                     yield DevicePanel(id="w-device-detail")
             with TabPane("Device", id="tab-device"):
                 yield DeviceConfig(id="w-device-config")
@@ -198,6 +201,17 @@ class TuiGPS(App):
         except Exception:
             pass
 
+        # Check if armed TOFF collection completed
+        if not self._gpsd.toff_armed and self._gpsd._toff_armed_samples:
+            try:
+                btn = self.query_one("#btn-arm-toff", Button)
+                if btn.variant == "success":
+                    n = len(self._gpsd._toff_armed_samples)
+                    btn.variant = "warning"
+                    btn.label = f"Arm TOFF ({n} collected)"
+            except Exception:
+                pass
+
         widget_ids = [
             "w-fix", "w-velocity", "w-skyplot", "w-signal",
             "w-errors", "w-device", "w-time",
@@ -218,6 +232,40 @@ class TuiGPS(App):
 
     def _heartbeat(self) -> None:
         """Periodic refresh for staleness detection and clock updates."""
+        self._refresh_ui()
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        btn_id = event.button.id
+        if btn_id == "btn-arm-toff":
+            self._arm_toff()
+        elif btn_id == "btn-clear-toff":
+            self._clear_toff()
+
+    def _arm_toff(self) -> None:
+        """Arm a fresh TOFF measurement run (20 samples)."""
+        self._gpsd._toff_buffer.clear()
+        self._gpsd._toff_armed_samples.clear()
+        self._gpsd.toff_armed = True
+        try:
+            btn = self.query_one("#btn-arm-toff", Button)
+            btn.variant = "success"
+            btn.label = "ARMED — collecting..."
+        except Exception:
+            pass
+        self.notify("TOFF armed — collecting 20 samples", timeout=2)
+
+    def _clear_toff(self) -> None:
+        """Clear TOFF history."""
+        self._gpsd._toff_buffer.clear()
+        self._gpsd._toff_armed_samples.clear()
+        self._gpsd.toff_armed = False
+        self._gps_data.toff_samples = []
+        try:
+            btn = self.query_one("#btn-arm-toff", Button)
+            btn.variant = "warning"
+            btn.label = "Arm TOFF (20 samples)"
+        except Exception:
+            pass
         self._refresh_ui()
 
     # ─── Actions ─────────────────────────────────────────────

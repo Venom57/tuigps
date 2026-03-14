@@ -6,6 +6,7 @@ import math
 import sys
 import threading
 import time
+from collections import deque
 
 from .data_model import (
     DeviceInfo,
@@ -50,6 +51,11 @@ class GPSDClient:
         self._on_update: callable = None
         self._on_error: callable = None
         self._on_nmea: callable = None
+        self._toff_buffer: deque[float] = deque(maxlen=20)
+        self._receipt_time: float = 0.0  # time.time() at message receipt
+        self.toff_armed = False  # armed mode: fresh accumulation run
+        self._toff_armed_samples: list[float] = []
+        self._toff_armed_target: int = 20
 
     @property
     def data(self) -> GPSData:
@@ -125,6 +131,7 @@ class GPSDClient:
             if not self._session.waiting(timeout=2):
                 continue
             result = self._session.read()
+            self._receipt_time = time.time()  # capture ASAP for precise TOFF
             if result == -1:
                 raise ConnectionError("gpsd disconnected")
 
@@ -228,10 +235,10 @@ class GPSDClient:
         d.ecefvy = self._safe_float(f.ecefvy)
         d.ecefvz = self._safe_float(f.ecefvz)
 
-        # Compute TOFF: GPS time vs system clock
+        # Compute TOFF: GPS time vs system clock (captured at message receipt)
         # gpsd only sends TOFF messages with PPS hardware; we compute it here
         # so it always works when there's a GPS time in the TPV.
-        if d.time:
+        if d.time and self._receipt_time > 0:
             try:
                 from datetime import datetime, timezone
 
@@ -242,9 +249,9 @@ class GPSDClient:
                     gps_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
                 gps_dt = gps_dt.replace(tzinfo=timezone.utc)
                 gps_epoch = gps_dt.timestamp()
-                sys_epoch = time.time()
+                sys_epoch = self._receipt_time  # precise: captured right after s.read()
 
-                # Split into sec + nsec for TOFFData
+                # Current TOFF for display
                 gps_sec = int(gps_epoch)
                 gps_nsec = (gps_epoch - gps_sec) * 1e9
                 sys_sec = int(sys_epoch)
@@ -256,6 +263,17 @@ class GPSDClient:
                     clock_sec=float(sys_sec),
                     clock_nsec=sys_nsec,
                 )
+
+                # Accumulate TOFF sample (offset in seconds)
+                offset = gps_epoch - sys_epoch
+                self._toff_buffer.append(offset)
+                d.toff_samples = list(self._toff_buffer)
+
+                # Armed mode: collect precise samples
+                if self.toff_armed:
+                    self._toff_armed_samples.append(offset)
+                    if len(self._toff_armed_samples) >= self._toff_armed_target:
+                        self.toff_armed = False
             except Exception:
                 pass
 

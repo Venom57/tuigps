@@ -104,6 +104,17 @@ SatelliteTable {
     height: auto;
 }
 
+#toff-controls {
+    height: auto;
+    margin: 0 0 1 0;
+    align: left middle;
+}
+
+#toff-controls Button {
+    margin: 0 1 0 0;
+    min-width: 10;
+}
+
 #timing-container DevicePanel {
     border: solid $accent;
     height: auto;

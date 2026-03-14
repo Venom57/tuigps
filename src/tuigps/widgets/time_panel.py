@@ -31,6 +31,17 @@ class TimePanel(Static):
         self._data = data
         self.refresh()
 
+    @staticmethod
+    def _fmt_offset(offset_sec: float) -> str:
+        """Format a time offset in appropriate units."""
+        us = offset_sec * 1e6
+        if abs(us) < 1:
+            return f"{us * 1000:+.1f} ns"
+        elif abs(us) < 1000:
+            return f"{us:+.3f} us"
+        else:
+            return f"{us / 1000:+.3f} ms"
+
     def render(self) -> Text:
         txt = Text()
         txt.append("Time & Timing\n", style="bold")
@@ -121,16 +132,31 @@ class TimePanel(Static):
         if math.isfinite(toff.real_sec):
             toff_offset = (toff.real_sec - toff.clock_sec) + (toff.real_nsec - toff.clock_nsec) / 1e9
             if math.isfinite(toff_offset):
-                toff_us = toff_offset * 1e6
                 txt.append("  Offset:  ", style="bright_black")
-                if abs(toff_us) < 1:
-                    txt.append(f"{toff_us * 1000:+.1f} ns\n")
-                elif abs(toff_us) < 1000:
-                    txt.append(f"{toff_us:+.3f} us\n")
-                else:
-                    txt.append(f"{toff_us / 1000:+.3f} ms\n")
+                txt.append(self._fmt_offset(toff_offset) + "\n")
         else:
             txt.append("  No TOFF data\n", style="dim")
+
+        # Accumulated TOFF stats
+        samples = d.toff_samples
+        if len(samples) >= 2:
+            import statistics
+            mean_s = statistics.mean(samples)
+            stdev_s = statistics.stdev(samples)
+            min_s = min(samples)
+            max_s = max(samples)
+
+            txt.append(f"  ({len(samples)} samples)\n", style="dim")
+            txt.append("  Mean:    ", style="bright_black")
+            txt.append(self._fmt_offset(mean_s) + "\n")
+            txt.append("  Std:     ", style="bright_black")
+            txt.append(self._fmt_offset(abs(stdev_s)) + "\n")
+            txt.append("  Min:     ", style="bright_black")
+            txt.append(self._fmt_offset(min_s) + "\n")
+            txt.append("  Max:     ", style="bright_black")
+            txt.append(self._fmt_offset(max_s) + "\n")
+        elif len(samples) == 1:
+            txt.append("  (1 sample — need more for stats)\n", style="dim")
 
         # ── DOP timing ──
         if math.isfinite(d.dop.tdop):

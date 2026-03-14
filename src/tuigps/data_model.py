@@ -142,6 +142,9 @@ class GPSData:
     device: DeviceInfo = field(default_factory=DeviceInfo)
     version: VersionInfo = field(default_factory=VersionInfo)
 
+    # TOFF history (last N offset samples in seconds, computed on gpsd thread)
+    toff_samples: list[float] = field(default_factory=list)
+
     # Satellites
     satellites: list[SatelliteInfo] = field(default_factory=list)
     satellites_used: int = 0
