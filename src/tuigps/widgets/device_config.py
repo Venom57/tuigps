@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import struct
 import subprocess
 import threading
@@ -235,7 +236,7 @@ class DeviceConfig(Vertical):
                 pass
 
     def _set_system_clock(self) -> None:
-        """Set the system clock from current GPS time."""
+        """Set the system clock from current GPS time via D-Bus (no sudo needed)."""
         if not self._data or not self._data.time:
             self._append_output("Error: no GPS time available")
             return
@@ -245,34 +246,63 @@ class DeviceConfig(Vertical):
 
         def run():
             try:
-                # Try timedatectl first (systemd), fall back to date -s
-                # Normalize ISO 8601 time for date command
+                from datetime import datetime, timezone
+
+                # Parse GPS time to microseconds since epoch for timedated
                 time_str = gps_time.replace("T", " ").replace("Z", "")
-                result = subprocess.run(
-                    ["sudo", "-n", "date", "-u", "-s", time_str],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if result.returncode == 0:
-                    output = f"System clock set to: {result.stdout.strip()}"
+                # Handle fractional seconds
+                if "." in time_str:
+                    dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S.%f")
                 else:
-                    # sudo -n failed (needs password), try with prompt
+                    dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
+                dt = dt.replace(tzinfo=timezone.utc)
+                usec = int(dt.timestamp() * 1_000_000)
+
+                # Disable NTP first so we can set time manually
+                subprocess.run(
+                    ["timedatectl", "set-ntp", "false"],
+                    capture_output=True, text=True, timeout=5,
+                )
+
+                # Set time via D-Bus (polkit handles authorization, no sudo)
+                result = subprocess.run(
+                    [
+                        "busctl", "call", "org.freedesktop.timedate1",
+                        "/org/freedesktop/timedate1",
+                        "org.freedesktop.timedate1",
+                        "SetTime", "xbb", str(usec), "true", "false",
+                    ],
+                    capture_output=True, text=True, timeout=10,
+                )
+
+                if result.returncode == 0:
+                    output = f"System clock set to: {gps_time}"
+                else:
+                    # D-Bus failed, try timedatectl set-time as fallback
+                    formatted = dt.strftime("%Y-%m-%d %H:%M:%S")
                     result = subprocess.run(
-                        ["sudo", "date", "-u", "-s", time_str],
-                        capture_output=True,
-                        text=True,
-                        timeout=30,
+                        ["timedatectl", "set-time", formatted],
+                        capture_output=True, text=True, timeout=10,
                     )
                     if result.returncode == 0:
-                        output = f"System clock set to: {result.stdout.strip()}"
+                        output = f"System clock set to: {formatted}"
                     else:
-                        output = f"Error: {result.stderr.strip()}"
+                        # Last resort: sudo -n date (passwordless only)
+                        result = subprocess.run(
+                            ["sudo", "-n", "date", "-u", "-s", time_str],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if result.returncode == 0:
+                            output = f"System clock set to: {result.stdout.strip()}"
+                        else:
+                            output = (
+                                f"Error: could not set time.\n"
+                                f"  busctl: {result.stderr.strip()}\n"
+                                f"  Tip: run 'sudo timedatectl set-ntp false' first,\n"
+                                f"  or add to sudoers: {os.environ.get('USER', 'user')} "
+                                f"ALL=(ALL) NOPASSWD: /usr/bin/date"
+                            )
                 self.app.call_from_thread(self._append_output, output)
-            except subprocess.TimeoutExpired:
-                self.app.call_from_thread(
-                    self._append_output, "Error: command timed out (sudo may need a password)"
-                )
             except Exception as e:
                 self.app.call_from_thread(self._append_output, f"Error: {e}")
 
