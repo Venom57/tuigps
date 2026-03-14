@@ -106,6 +106,7 @@ class GPSDClient:
             _gps_module.WATCH_ENABLE
             | _gps_module.WATCH_JSON
             | _gps_module.WATCH_PPS
+            | _gps_module.WATCH_TIMING
             | _gps_module.WATCH_NMEA
         )
         self._session = _gps_module.gps(
