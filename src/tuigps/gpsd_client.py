@@ -49,16 +49,18 @@ class GPSDClient:
         self._lock = threading.Lock()
         self._on_update: callable = None
         self._on_error: callable = None
+        self._on_nmea: callable = None
 
     @property
     def data(self) -> GPSData:
         with self._lock:
             return self._data
 
-    def start(self, on_update: callable = None, on_error: callable = None) -> None:
+    def start(self, on_update: callable = None, on_error: callable = None, on_nmea: callable = None) -> None:
         """Start the gpsd polling thread."""
         self._on_update = on_update
         self._on_error = on_error
+        self._on_nmea = on_nmea
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True, name="gpsd-client")
         self._thread.start()
@@ -104,6 +106,7 @@ class GPSDClient:
             _gps_module.WATCH_ENABLE
             | _gps_module.WATCH_JSON
             | _gps_module.WATCH_PPS
+            | _gps_module.WATCH_NMEA
         )
         self._session = _gps_module.gps(
             host=self.host,
@@ -123,6 +126,12 @@ class GPSDClient:
             result = self._session.read()
             if result == -1:
                 raise ConnectionError("gpsd disconnected")
+
+            # Capture raw NMEA sentences before extracting structured data
+            response = getattr(self._session, "response", "")
+            if response and response.startswith("$") and self._on_nmea:
+                self._on_nmea(response.rstrip())
+
             self._extract_data()
             self._notify_update()
 

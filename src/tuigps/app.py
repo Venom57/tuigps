@@ -10,7 +10,9 @@ from textual.containers import Grid, Vertical
 from textual.widgets import Header, TabbedContent, TabPane
 
 from .data_model import GPSData
+from .gps_logger import GPSLogger
 from .gpsd_client import GPSDClient
+from .position_hold import PositionHold
 from .screens.settings_screen import SettingsScreen
 from .widgets.connection_status import ConnectionStatus
 from .widgets.constellation_panel import ConstellationPanel
@@ -18,6 +20,7 @@ from .widgets.device_config import DeviceConfig
 from .widgets.device_panel import DevicePanel
 from .widgets.error_panel import ErrorPanel
 from .widgets.fix_panel import FixPanel
+from .widgets.nmea_viewer import NMEAViewer
 from .widgets.position_panel import PositionPanel
 from .widgets.satellite_table import SatelliteTable
 from .widgets.signal_chart import SignalChart
@@ -41,6 +44,8 @@ class TuiGPS(App):
         Binding("r", "reconnect", "Reconnect"),
         Binding("u", "cycle_units", "Units"),
         Binding("m", "open_maps", "Maps"),
+        Binding("l", "toggle_log", "Log"),
+        Binding("h", "toggle_hold", "Hold"),
     ]
 
     ENABLE_COMMAND_PALETTE = False
@@ -54,10 +59,12 @@ class TuiGPS(App):
         self._theme_list: list[str] = []
         self._theme_index = 0
         self._enabled_gnss: set[str] = {"gps"}
+        self._gps_logger = GPSLogger()
+        self._hold = PositionHold()
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with TabbedContent("Dashboard", "Satellites", "Timing", "Device"):
+        with TabbedContent("Dashboard", "Satellites", "Timing", "Device", "NMEA"):
             with TabPane("Dashboard", id="tab-dashboard"):
                 with Grid(id="dashboard-grid"):
                     yield PositionPanel(id="w-position")
@@ -78,6 +85,8 @@ class TuiGPS(App):
                     yield DevicePanel(id="w-device-detail")
             with TabPane("Device", id="tab-device"):
                 yield DeviceConfig(id="w-device-config")
+            with TabPane("NMEA", id="tab-nmea"):
+                yield NMEAViewer(id="w-nmea")
         yield ConnectionStatus(id="w-connection")
 
     def on_mount(self) -> None:
@@ -91,6 +100,7 @@ class TuiGPS(App):
         self._gpsd.start(
             on_update=self._on_gpsd_update,
             on_error=self._on_gpsd_error,
+            on_nmea=self._on_nmea,
         )
 
         # Heartbeat refresh (catches staleness even without gpsd updates)
@@ -99,6 +109,13 @@ class TuiGPS(App):
     def _on_gpsd_update(self, data: GPSData) -> None:
         """Called from the gpsd thread — marshal to Textual event loop."""
         self._gps_data = data
+
+        # Log and hold in the callback (already on gpsd thread, but data is fresh)
+        if self._gps_logger.is_active:
+            self._gps_logger.log_point(data)
+        if self._hold.is_active and data.has_fix:
+            self._hold.add_fix(data.latitude, data.longitude, data.alt_msl)
+
         try:
             self.call_from_thread(self._refresh_ui)
         except Exception:
@@ -111,11 +128,47 @@ class TuiGPS(App):
         except Exception:
             pass
 
+    def _on_nmea(self, sentence: str) -> None:
+        """Called from the gpsd thread with raw NMEA sentences."""
+        try:
+            self.call_from_thread(self._deliver_nmea, sentence)
+        except Exception:
+            pass
+
+    def _deliver_nmea(self, sentence: str) -> None:
+        """Deliver NMEA sentence to the viewer widget (on Textual thread)."""
+        try:
+            viewer = self.query_one("#w-nmea", NMEAViewer)
+            viewer.append_nmea(sentence)
+        except Exception:
+            pass
+
     def _refresh_ui(self) -> None:
         """Push current GPS data to all widgets."""
+        # Pass hold data to position panel
+        try:
+            pos = self.query_one("#w-position", PositionPanel)
+            pos.units = self._units
+            pos.coord_format = self._coord_format
+            pos.set_hold_data(self._hold.result if self._hold.is_active else None)
+            pos.update_gps_data(self._gps_data)
+        except Exception:
+            pass
+
+        # Pass logging/hold state to connection status
+        try:
+            conn = self.query_one("#w-connection", ConnectionStatus)
+            conn.logging_active = self._gps_logger.is_active
+            conn.log_count = self._gps_logger.fix_count
+            conn.hold_active = self._hold.is_active
+            conn.hold_count = self._hold.fix_count
+            conn.update_gps_data(self._gps_data)
+        except Exception:
+            pass
+
         widget_ids = [
-            "w-position", "w-fix", "w-velocity", "w-skyplot", "w-signal",
-            "w-errors", "w-device", "w-time", "w-connection",
+            "w-fix", "w-velocity", "w-skyplot", "w-signal",
+            "w-errors", "w-device", "w-time",
             "w-constellations", "w-sattable", "w-time-detail", "w-device-detail",
             "w-device-config",
         ]
@@ -172,6 +225,7 @@ class TuiGPS(App):
                 self._gpsd.start(
                     on_update=self._on_gpsd_update,
                     on_error=self._on_gpsd_error,
+                    on_nmea=self._on_nmea,
                 )
                 self.notify("Reconnecting to gpsd...", timeout=3)
 
@@ -198,6 +252,28 @@ class TuiGPS(App):
         webbrowser.open(url)
         self.notify("Opening Google Maps...", timeout=2)
 
+    def action_toggle_log(self) -> None:
+        """Toggle GPS logging to file."""
+        if self._gps_logger.is_active:
+            path = self._gps_logger.filepath
+            self._gps_logger.stop()
+            self.notify(f"Logging stopped: {path} ({self._gps_logger.fix_count} pts)", timeout=4)
+        else:
+            path = self._gps_logger.start()
+            self.notify(f"Logging to {path}", timeout=3)
+
+    def action_toggle_hold(self) -> None:
+        """Toggle position hold/averaging."""
+        if self._hold.is_active:
+            result = self._hold.stop()
+            self.notify(
+                f"Hold stopped: {result.fix_count} fixes, CEP50={result.cep50:.2f}m",
+                timeout=4,
+            )
+        else:
+            self._hold.start()
+            self.notify("Position hold started — accumulating fixes", timeout=3)
+
     def action_reconnect(self) -> None:
         """Force reconnection to gpsd."""
         self._gpsd.stop()
@@ -205,11 +281,13 @@ class TuiGPS(App):
         self._gpsd.start(
             on_update=self._on_gpsd_update,
             on_error=self._on_gpsd_error,
+            on_nmea=self._on_nmea,
         )
         self.notify("Reconnecting to gpsd...", timeout=3)
 
     def on_unmount(self) -> None:
-        """Clean up gpsd connection on exit."""
+        """Clean up on exit."""
+        self._gps_logger.stop()
         self._gpsd.stop()
 
 

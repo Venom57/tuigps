@@ -163,6 +163,34 @@ DeviceConfig {
     margin-top: 1;
 }
 
+/* ─── NMEA viewer tab ─── */
+
+NMEAViewer {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#nmea-controls {
+    height: auto;
+    margin-bottom: 1;
+    align: left middle;
+}
+
+#nmea-controls Button {
+    margin: 0 1 0 0;
+    min-width: 6;
+}
+
+#nmea-controls #nmea-stats {
+    width: auto;
+    margin-left: 2;
+}
+
+#nmea-log {
+    height: 1fr;
+    border: solid $accent;
+}
+
 /* ─── Settings modal ─── */
 
 #settings-dialog {
