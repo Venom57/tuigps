@@ -15,6 +15,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Input, Label, RichLog, Select
 
+from ..clock_sync import set_clock_from_gps
 from ..data_model import GPSData
 
 
@@ -198,7 +199,8 @@ class DeviceConfig(Vertical):
                 yield Button("Read Nav", id="btn-read", variant="default")
                 yield Button("Read Rate", id="btn-read-rate", variant="default")
             with Horizontal(classes="config-row"):
-                yield Button("Set Clock (GPS)", id="btn-set-clock", variant="warning")
+                yield Button("Arm Clock Sync", id="btn-arm-clock", variant="warning")
+                yield Button("Set Clock (now)", id="btn-set-clock", variant="warning")
                 yield Button("Set Clock (PPS)", id="btn-pps-sync", variant="warning")
 
             with Horizontal(classes="config-row"):
@@ -246,6 +248,8 @@ class DeviceConfig(Vertical):
             self._run_ubxtool("-p CFG-RATE")
         elif btn_id == "btn-gnss-read":
             self._run_ubxtool("-p CFG-GNSS")
+        elif btn_id == "btn-arm-clock":
+            self._arm_clock_sync()
         elif btn_id == "btn-set-clock":
             self._set_system_clock()
         elif btn_id == "btn-pps-sync":
@@ -277,84 +281,47 @@ class DeviceConfig(Vertical):
             except Exception:
                 pass
 
+    def _arm_clock_sync(self) -> None:
+        """Arm clock sync — fires on the gpsd thread when the next fix arrives.
+
+        This gives minimum latency: the clock is set immediately when gpsd
+        delivers a fresh TPV message, before marshaling to the Textual event loop.
+        """
+        if self.app._armed_clock_set:
+            # Already armed, disarm
+            self.app._armed_clock_set = False
+            self._append_output("Clock sync disarmed")
+            try:
+                btn = self.query_one("#btn-arm-clock", Button)
+                btn.variant = "warning"
+                btn.label = "Arm Clock Sync"
+            except Exception:
+                pass
+        else:
+            self.app._armed_clock_set = True
+            self._append_output("Clock sync ARMED — will fire on next GPS update")
+            try:
+                btn = self.query_one("#btn-arm-clock", Button)
+                btn.variant = "success"
+                btn.label = "ARMED (click to cancel)"
+            except Exception:
+                pass
+
     def _set_system_clock(self) -> None:
-        """Set the system clock from current GPS time via D-Bus (no sudo needed)."""
+        """Set the system clock immediately from current GPS time."""
         if not self._data or not self._data.time:
             self._append_output("Error: no GPS time available")
             return
 
         gps_time = self._data.time
-        fix_age = time.time() - self._data.last_seen if self._data.last_seen > 0 else 0.0
-        self._append_output(f"Setting system clock to GPS time: {gps_time} (fix age: {fix_age:.1f}s)")
+        last_seen = self._data.last_seen
+        fix_age = time.time() - last_seen if last_seen > 0 else 0.0
+        self._append_output(f"Setting system clock now: {gps_time} (fix age: {fix_age:.1f}s)")
 
         def run():
             try:
-                from datetime import datetime, timedelta, timezone
-
-                # Parse GPS time to microseconds since epoch for timedated
-                time_str = gps_time.replace("T", " ").replace("Z", "")
-                # Handle fractional seconds
-                if "." in time_str:
-                    dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S.%f")
-                else:
-                    dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
-                dt = dt.replace(tzinfo=timezone.utc)
-
-                # Compensate for age of the fix (time elapsed since gpsd reported it)
-                dt += timedelta(seconds=fix_age)
-
-                usec = int(dt.timestamp() * 1_000_000)
-
-                # Disable NTP first so we can set time manually
-                subprocess.run(
-                    ["timedatectl", "set-ntp", "false"],
-                    capture_output=True, text=True, timeout=5,
-                )
-
-                # Set time via D-Bus (absolute UTC usec, allow polkit)
-                result = subprocess.run(
-                    [
-                        "busctl", "call", "org.freedesktop.timedate1",
-                        "/org/freedesktop/timedate1",
-                        "org.freedesktop.timedate1",
-                        "SetTime", "xbb", str(usec), "false", "true",
-                    ],
-                    capture_output=True, text=True, timeout=10,
-                )
-
-                adjusted = dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-
-                if result.returncode == 0:
-                    output = f"System clock set to: {adjusted} UTC"
-                else:
-                    # D-Bus failed, try timedatectl set-time as fallback
-                    # timedatectl expects LOCAL time, so convert from UTC
-                    local_dt = dt.astimezone()
-                    formatted = local_dt.strftime("%Y-%m-%d %H:%M:%S")
-                    result = subprocess.run(
-                        ["timedatectl", "set-time", formatted],
-                        capture_output=True, text=True, timeout=10,
-                    )
-                    if result.returncode == 0:
-                        output = f"System clock set to: {formatted} (local)"
-                    else:
-                        # Last resort: sudo -n date (passwordless only)
-                        utc_str = dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-                        result = subprocess.run(
-                            ["sudo", "-n", "date", "-u", "-s", utc_str],
-                            capture_output=True, text=True, timeout=5,
-                        )
-                        if result.returncode == 0:
-                            output = f"System clock set to: {result.stdout.strip()}"
-                        else:
-                            output = (
-                                f"Error: could not set time.\n"
-                                f"  busctl: {result.stderr.strip()}\n"
-                                f"  Tip: run 'sudo timedatectl set-ntp false' first,\n"
-                                f"  or add to sudoers: {os.environ.get('USER', 'user')} "
-                                f"ALL=(ALL) NOPASSWD: /usr/bin/date"
-                            )
-                self.app.call_from_thread(self._append_output, output)
+                msg = set_clock_from_gps(gps_time, last_seen)
+                self.app.call_from_thread(self._append_output, msg)
             except Exception as e:
                 self.app.call_from_thread(self._append_output, f"Error: {e}")
 

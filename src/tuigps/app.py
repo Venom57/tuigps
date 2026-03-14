@@ -7,8 +7,9 @@ import webbrowser
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Vertical
-from textual.widgets import Header, TabbedContent, TabPane
+from textual.widgets import Button, Header, TabbedContent, TabPane
 
+from .clock_sync import set_clock_from_gps
 from .data_model import GPSData
 from .gps_logger import GPSLogger
 from .gpsd_client import GPSDClient
@@ -61,6 +62,7 @@ class TuiGPS(App):
         self._enabled_gnss: set[str] = {"gps"}
         self._gps_logger = GPSLogger()
         self._hold = PositionHold()
+        self._armed_clock_set = False
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -110,6 +112,18 @@ class TuiGPS(App):
         """Called from the gpsd thread — marshal to Textual event loop."""
         self._gps_data = data
 
+        # Armed clock set: fire immediately on gpsd thread for minimum latency.
+        # The GPS time string is as fresh as possible — no event loop delay.
+        if self._armed_clock_set and data.time:
+            self._armed_clock_set = False
+            try:
+                msg = set_clock_from_gps(data.time, data.last_seen)
+                self.call_from_thread(self._deliver_clock_result, msg)
+            except Exception as e:
+                self.call_from_thread(
+                    self._deliver_clock_result, f"Clock sync error: {e}"
+                )
+
         # Log and hold in the callback (already on gpsd thread, but data is fresh)
         if self._gps_logger.is_active:
             self._gps_logger.log_point(data)
@@ -134,6 +148,24 @@ class TuiGPS(App):
             self.call_from_thread(self._deliver_nmea, sentence)
         except Exception:
             pass
+
+    def _deliver_clock_result(self, message: str) -> None:
+        """Show clock sync result in Device tab output and as notification."""
+        try:
+            config = self.query_one("#w-device-config", DeviceConfig)
+            config._append_output(message)
+            # Reset the arm button
+            btn = config.query_one("#btn-arm-clock", Button)
+            btn.variant = "warning"
+            btn.label = "Arm Clock Sync"
+        except Exception:
+            pass
+        is_error = message.startswith("Error")
+        self.notify(
+            message.split("\n")[0],
+            severity="error" if is_error else "information",
+            timeout=4,
+        )
 
     def _deliver_nmea(self, sentence: str) -> None:
         """Deliver NMEA sentence to the viewer widget (on Textual thread)."""
