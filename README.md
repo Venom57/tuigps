@@ -12,7 +12,7 @@ Terminal UI GPS monitoring tool built with [Textual](https://textual.textualize.
 - **Dashboard** — position, fix status, velocity, sky plot, signal strength, error estimates, device info, and time in a single view
 - **Satellites** — detailed table of all visible satellites with constellation breakdown
 - **Timing** — GPS time, PPS offset and quality, TOFF, leap seconds, time accuracy
-- **Device Config** — u-blox 8 configuration via ubxtool: platform model, nav rate, power mode, PPS, constellation enable/disable, and raw command input
+- **Device Config** — u-blox 8 configuration via ubxtool: platform model, nav rate, power mode, serial speed, PPS, constellation enable/disable, and raw command input
 - **NMEA Viewer** — live stream of raw NMEA sentences with filtering by type (GGA, RMC, GSA, GSV, VTG, GLL) and pause/resume
 - **GPS Logging** — log position fixes to GPX and CSV files with `l` key
 - **Position Hold** — accumulate fixes and compute position statistics (mean, std dev, CEP50/CEP95) with `h` key

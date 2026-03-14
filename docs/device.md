@@ -29,6 +29,13 @@ Configures the receiver's power management:
 - **Interval** — Periodic tracking
 - **Aggressive 1Hz/2Hz** — Aggressive power saving with fixed update rate
 
+### Serial Speed
+Sets the receiver's serial port baud rate. Common values are 9600 (default for most u-blox receivers), 38400, 115200, and 460800. Changing the baud rate:
+1. Sends `ubxtool -S SPEED` to configure the receiver
+2. Runs `gpsctl -s SPEED` to update gpsd
+
+**Note:** Use "Save Config" after changing the baud rate to persist across power cycles. Higher baud rates reduce serial latency and are required for high nav rates (5-10 Hz).
+
 ### PPS Configuration
 Configures the Pulse Per Second timing output:
 
@@ -43,7 +50,8 @@ Toggle buttons to enable/disable GNSS constellations on the receiver. Green indi
 
 ### System Clock
 
-- **Set Clock (GPS)** — Sets the system clock from the latest GPS time, compensating for fix age. Uses D-Bus timedated (no sudo required on most desktop systems), with timedatectl and sudo -n fallbacks.
+- **Arm Clock Sync** — Arms a clock sync that fires on the very next gpsd message for minimum latency. Click again to disarm.
+- **Set Clock (now)** — Sets the system clock from the latest GPS time, compensating for fix age. Uses D-Bus timedated (no sudo required on most desktop systems), with timedatectl and sudo -n fallbacks.
 - **Set Clock (PPS)** — PPS-disciplined clock sync for sub-millisecond accuracy. Blocks on the kernel PPS ioctl (`PPS_FETCH`) to capture the exact timestamp of the next PPS pulse edge, computes the offset between the kernel timestamp and the GPS second the pulse marks, then applies a relative adjustment via D-Bus SetTime. Requires a `/dev/pps*` device (e.g., `pps_gpio` or `pps_ldisc` kernel module).
 
 ### Utility Buttons
