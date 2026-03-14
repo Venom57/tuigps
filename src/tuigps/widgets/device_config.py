@@ -6,6 +6,7 @@ import os
 import struct
 import subprocess
 import threading
+import time
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -242,11 +243,12 @@ class DeviceConfig(Vertical):
             return
 
         gps_time = self._data.time
-        self._append_output(f"Setting system clock to GPS time: {gps_time}")
+        fix_age = time.time() - self._data.last_seen if self._data.last_seen > 0 else 0.0
+        self._append_output(f"Setting system clock to GPS time: {gps_time} (fix age: {fix_age:.1f}s)")
 
         def run():
             try:
-                from datetime import datetime, timezone
+                from datetime import datetime, timedelta, timezone
 
                 # Parse GPS time to microseconds since epoch for timedated
                 time_str = gps_time.replace("T", " ").replace("Z", "")
@@ -256,6 +258,10 @@ class DeviceConfig(Vertical):
                 else:
                     dt = datetime.strptime(time_str, "%Y-%m-%d %H:%M:%S")
                 dt = dt.replace(tzinfo=timezone.utc)
+
+                # Compensate for age of the fix (time elapsed since gpsd reported it)
+                dt += timedelta(seconds=fix_age)
+
                 usec = int(dt.timestamp() * 1_000_000)
 
                 # Disable NTP first so we can set time manually
@@ -275,8 +281,10 @@ class DeviceConfig(Vertical):
                     capture_output=True, text=True, timeout=10,
                 )
 
+                adjusted = dt.strftime("%Y-%m-%d %H:%M:%S.%f")
+
                 if result.returncode == 0:
-                    output = f"System clock set to: {gps_time}"
+                    output = f"System clock set to: {adjusted} UTC"
                 else:
                     # D-Bus failed, try timedatectl set-time as fallback
                     # timedatectl expects LOCAL time, so convert from UTC
@@ -287,11 +295,12 @@ class DeviceConfig(Vertical):
                         capture_output=True, text=True, timeout=10,
                     )
                     if result.returncode == 0:
-                        output = f"System clock set to: {formatted}"
+                        output = f"System clock set to: {formatted} (local)"
                     else:
                         # Last resort: sudo -n date (passwordless only)
+                        utc_str = dt.strftime("%Y-%m-%d %H:%M:%S.%f")
                         result = subprocess.run(
-                            ["sudo", "-n", "date", "-u", "-s", time_str],
+                            ["sudo", "-n", "date", "-u", "-s", utc_str],
                             capture_output=True, text=True, timeout=5,
                         )
                         if result.returncode == 0:
