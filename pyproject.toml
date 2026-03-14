@@ -1,0 +1,24 @@
+[project]
+name = "tuigps"
+version = "0.1.0"
+description = "Terminal UI GPS monitor using gpsd"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+dependencies = [
+    "textual>=0.80.0",
+    "rich>=13.0.0",
+]
+
+[project.scripts]
+tuigps = "tuigps.app:run"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/tuigps"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/tuigps"]

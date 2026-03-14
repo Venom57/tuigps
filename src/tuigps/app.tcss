@@ -1,0 +1,209 @@
+/* tuigps main layout */
+
+Screen {
+    layout: vertical;
+}
+
+TabbedContent {
+    height: 1fr;
+}
+
+ContentSwitcher {
+    height: 1fr;
+}
+
+TabPane {
+    height: 1fr;
+}
+
+/* ─── Dashboard tab ─── */
+
+#dashboard-grid {
+    layout: grid;
+    grid-size: 3 3;
+    grid-columns: 1fr 1fr 1fr;
+    grid-rows: 3fr 4fr 3fr;
+    grid-gutter: 0 1;
+    height: 1fr;
+    padding: 0 1;
+}
+
+/* Row 1: info panels */
+PositionPanel {
+    column-span: 1;
+    border: solid $accent;
+}
+
+FixPanel {
+    column-span: 1;
+    border: solid $accent;
+}
+
+VelocityPanel {
+    column-span: 1;
+    border: solid $accent;
+}
+
+/* Row 2: sky plot + signal chart */
+SkyPlot {
+    column-span: 2;
+    border: heavy $accent;
+}
+
+SignalChart {
+    column-span: 1;
+    border: solid $accent;
+}
+
+/* Row 3: bottom panels */
+ErrorPanel {
+    column-span: 1;
+    border: solid $accent;
+}
+
+DevicePanel {
+    column-span: 1;
+    border: solid $accent;
+}
+
+TimePanel {
+    column-span: 1;
+    border: solid $accent;
+}
+
+
+/* ─── Satellites tab ─── */
+
+#satellites-container {
+    layout: vertical;
+    height: 100%;
+    padding: 0 1;
+}
+
+ConstellationPanel {
+    border: solid $accent;
+    height: auto;
+    max-height: 10;
+}
+
+SatelliteTable {
+    border: solid $accent;
+    height: 1fr;
+}
+
+/* ─── Timing tab ─── */
+
+#timing-container {
+    layout: vertical;
+    height: 100%;
+    padding: 0 1;
+}
+
+#timing-container TimePanel {
+    border: solid $accent;
+    height: auto;
+}
+
+#timing-container DevicePanel {
+    border: solid $accent;
+    height: auto;
+}
+
+/* ─── Device config tab ─── */
+
+DeviceConfig {
+    height: 1fr;
+    padding: 0 1;
+}
+
+#config-controls {
+    height: auto;
+    max-height: 60%;
+}
+
+.config-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+.config-row {
+    height: auto;
+    margin-bottom: 0;
+    align: left middle;
+}
+
+.config-label {
+    width: 18;
+    height: 3;
+    content-align: left middle;
+}
+
+.config-row Select {
+    width: 24;
+    margin-right: 1;
+}
+
+.config-row Button {
+    margin: 0 1 0 0;
+    min-width: 8;
+}
+
+.config-row Input {
+    width: 1fr;
+    margin-right: 1;
+}
+
+.gnss-btn {
+    min-width: 10;
+}
+
+.config-output {
+    height: 1fr;
+    border: solid $accent;
+    margin-top: 1;
+}
+
+/* ─── Settings modal ─── */
+
+#settings-dialog {
+    width: 70;
+    max-width: 80;
+    height: auto;
+    max-height: 36;
+    border: heavy $accent;
+    background: $surface;
+    padding: 1 2;
+}
+
+#settings-dialog Label {
+    margin: 1 0 0 0;
+}
+
+#settings-dialog .settings-title {
+    text-style: bold;
+    width: 100%;
+    content-align: center middle;
+    margin-bottom: 1;
+}
+
+#settings-buttons {
+    layout: horizontal;
+    height: auto;
+    margin-top: 1;
+    align: center middle;
+}
+
+#settings-buttons Button {
+    margin: 0 1;
+}
+
+#gnss-checkboxes {
+    height: auto;
+    margin: 0 0;
+}
+
+#gnss-checkboxes Checkbox {
+    width: auto;
+    margin: 0 1 0 0;
+    height: auto;
+}
