@@ -53,9 +53,7 @@ class GPSDClient:
         self._on_nmea: callable = None
         self._toff_buffer: deque[float] = deque(maxlen=20)
         self._receipt_time: float = 0.0  # time.time() at message receipt
-        self.toff_armed = False  # armed mode: fresh accumulation run
-        self._toff_armed_samples: list[float] = []
-        self._toff_armed_target: int = 20
+        self.toff_armed = False  # armed: fire on next TPV with GPS time
 
     @property
     def data(self) -> GPSData:
@@ -269,11 +267,12 @@ class GPSDClient:
                 self._toff_buffer.append(offset)
                 d.toff_samples = list(self._toff_buffer)
 
-                # Armed mode: collect precise samples
+                # Armed mode: single-shot on next TPV with GPS time
                 if self.toff_armed:
-                    self._toff_armed_samples.append(offset)
-                    if len(self._toff_armed_samples) >= self._toff_armed_target:
-                        self.toff_armed = False
+                    self.toff_armed = False
+                    d.toff_armed_offset = offset
+                    d.toff_armed_gps_time = d.time
+                    d.toff_armed_sys_time = sys_epoch
             except Exception:
                 pass
 

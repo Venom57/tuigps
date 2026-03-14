@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import math
 import webbrowser
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
-from textual.containers import Grid, Horizontal, Vertical
+from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Header, TabbedContent, TabPane
 
 from .clock_sync import set_clock_from_gps
@@ -68,24 +69,25 @@ class TuiGPS(App):
         yield Header()
         with TabbedContent("Dashboard", "Satellites", "Timing", "Device", "NMEA"):
             with TabPane("Dashboard", id="tab-dashboard"):
-                with Grid(id="dashboard-grid"):
-                    yield PositionPanel(id="w-position")
-                    yield FixPanel(id="w-fix")
-                    yield VelocityPanel(id="w-velocity")
-                    yield SkyPlot(id="w-skyplot")
-                    yield SignalChart(id="w-signal")
-                    yield ErrorPanel(id="w-errors")
-                    yield DevicePanel(id="w-device")
-                    yield TimePanel(id="w-time")
+                with VerticalScroll(id="dashboard-scroll"):
+                    with Grid(id="dashboard-grid"):
+                        yield PositionPanel(id="w-position")
+                        yield FixPanel(id="w-fix")
+                        yield VelocityPanel(id="w-velocity")
+                        yield SkyPlot(id="w-skyplot")
+                        yield SignalChart(id="w-signal")
+                        yield ErrorPanel(id="w-errors")
+                        yield DevicePanel(id="w-device")
+                        yield TimePanel(id="w-time")
             with TabPane("Satellites", id="tab-satellites"):
-                with Vertical(id="satellites-container"):
+                with VerticalScroll(id="satellites-container"):
                     yield ConstellationPanel(id="w-constellations")
                     yield SatelliteTable(id="w-sattable")
             with TabPane("Timing", id="tab-timing"):
-                with Vertical(id="timing-container"):
+                with VerticalScroll(id="timing-container"):
                     yield TimePanel(id="w-time-detail", show_pps=True)
                     with Horizontal(id="toff-controls"):
-                        yield Button("Arm TOFF (20 samples)", id="btn-arm-toff", variant="warning")
+                        yield Button("Arm TOFF", id="btn-arm-toff", variant="warning")
                         yield Button("Clear TOFF", id="btn-clear-toff", variant="default")
                     yield DevicePanel(id="w-device-detail")
             with TabPane("Device", id="tab-device"):
@@ -201,14 +203,14 @@ class TuiGPS(App):
         except Exception:
             pass
 
-        # Check if armed TOFF collection completed
-        if not self._gpsd.toff_armed and self._gpsd._toff_armed_samples:
+        # Check if armed TOFF fired (single-shot)
+        if not self._gpsd.toff_armed and math.isfinite(self._gps_data.toff_armed_offset):
             try:
                 btn = self.query_one("#btn-arm-toff", Button)
                 if btn.variant == "success":
-                    n = len(self._gpsd._toff_armed_samples)
+                    offset_ms = self._gps_data.toff_armed_offset * 1000
                     btn.variant = "warning"
-                    btn.label = f"Arm TOFF ({n} collected)"
+                    btn.label = f"Arm TOFF (delta: {offset_ms:+.1f} ms)"
             except Exception:
                 pass
 
@@ -242,28 +244,32 @@ class TuiGPS(App):
             self._clear_toff()
 
     def _arm_toff(self) -> None:
-        """Arm a fresh TOFF measurement run (20 samples)."""
-        self._gpsd._toff_buffer.clear()
-        self._gpsd._toff_armed_samples.clear()
+        """Arm single-shot TOFF: fires on next TPV message with GPS time."""
+        # Clear previous armed result
+        self._gps_data.toff_armed_offset = float("nan")
+        self._gps_data.toff_armed_gps_time = ""
+        self._gps_data.toff_armed_sys_time = 0.0
         self._gpsd.toff_armed = True
         try:
             btn = self.query_one("#btn-arm-toff", Button)
             btn.variant = "success"
-            btn.label = "ARMED — collecting..."
+            btn.label = "ARMED — waiting..."
         except Exception:
             pass
-        self.notify("TOFF armed — collecting 20 samples", timeout=2)
+        self.notify("TOFF armed — waiting for next GPS message", timeout=2)
 
     def _clear_toff(self) -> None:
-        """Clear TOFF history."""
+        """Clear TOFF history and armed result."""
         self._gpsd._toff_buffer.clear()
-        self._gpsd._toff_armed_samples.clear()
         self._gpsd.toff_armed = False
         self._gps_data.toff_samples = []
+        self._gps_data.toff_armed_offset = float("nan")
+        self._gps_data.toff_armed_gps_time = ""
+        self._gps_data.toff_armed_sys_time = 0.0
         try:
             btn = self.query_one("#btn-arm-toff", Button)
             btn.variant = "warning"
-            btn.label = "Arm TOFF (20 samples)"
+            btn.label = "Arm TOFF"
         except Exception:
             pass
         self._refresh_ui()

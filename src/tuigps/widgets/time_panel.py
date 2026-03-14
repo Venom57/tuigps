@@ -137,6 +137,21 @@ class TimePanel(Static):
         else:
             txt.append("  No TOFF data\n", style="dim")
 
+        # Armed TOFF result (single-shot measurement)
+        if math.isfinite(d.toff_armed_offset):
+            from datetime import datetime, timezone
+            txt.append("\n")
+            txt.append("Armed Measurement\n", style="bold cyan")
+            txt.append("─" * 30 + "\n", style="bright_black")
+            txt.append("  Delta:   ", style="bright_black")
+            txt.append(self._fmt_offset(d.toff_armed_offset) + "\n", style="bold")
+            txt.append("  GPS:     ", style="bright_black")
+            txt.append(f"{d.toff_armed_gps_time}\n")
+            if d.toff_armed_sys_time > 0:
+                sys_dt = datetime.fromtimestamp(d.toff_armed_sys_time, tz=timezone.utc)
+                txt.append("  System:  ", style="bright_black")
+                txt.append(f"{sys_dt.strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3]}Z\n")
+
         # Accumulated TOFF stats
         samples = d.toff_samples
         if len(samples) >= 2:
@@ -146,7 +161,7 @@ class TimePanel(Static):
             min_s = min(samples)
             max_s = max(samples)
 
-            txt.append(f"  ({len(samples)} samples)\n", style="dim")
+            txt.append(f"\n  ({len(samples)} samples)\n", style="dim")
             txt.append("  Mean:    ", style="bright_black")
             txt.append(self._fmt_offset(mean_s) + "\n")
             txt.append("  Std:     ", style="bright_black")

@@ -105,6 +105,17 @@ PPS_DURATIONS = [
     (10, "10 us"),
 ]
 
+# Serial port baud rates
+BAUD_RATES = [
+    (9600, "9600"),
+    (19200, "19200"),
+    (38400, "38400"),
+    (57600, "57600"),
+    (115200, "115200"),
+    (230400, "230400"),
+    (460800, "460800"),
+]
+
 # GNSS constellations for device config
 CONSTELLATIONS = ["GPS", "GLONASS", "GALILEO", "BEIDOU", "SBAS", "QZSS"]
 
@@ -160,6 +171,16 @@ class DeviceConfig(Vertical):
                     prompt="Select mode...",
                 )
                 yield Button("Set", id="btn-power", variant="primary")
+
+            with Horizontal(classes="config-row"):
+                yield Label("Serial Speed:   ", classes="config-label")
+                yield Select(
+                    [(name, val) for val, name in BAUD_RATES],
+                    id="sel-baud",
+                    prompt="Select baud...",
+                )
+                yield Button("Set", id="btn-baud", variant="primary")
+                yield Button("Read", id="btn-baud-read", variant="default")
 
             with Horizontal(classes="config-row"):
                 yield Label("PPS Frequency:  ", classes="config-label")
@@ -228,6 +249,12 @@ class DeviceConfig(Vertical):
             sel = self.query_one("#sel-power", Select)
             if sel.value is not Select.BLANK:
                 self._run_ubxtool(f"-p PMS,{sel.value}")
+        elif btn_id == "btn-baud":
+            sel = self.query_one("#sel-baud", Select)
+            if sel.value is not Select.BLANK:
+                self._set_baud_rate(int(sel.value))
+        elif btn_id == "btn-baud-read":
+            self._run_ubxtool("-p CFG-PRT")
         elif btn_id == "btn-pps-apply":
             freq_sel = self.query_one("#sel-pps-freq", Select)
             dur_sel = self.query_one("#sel-pps-dur", Select)
@@ -518,6 +545,55 @@ class DeviceConfig(Vertical):
         state = "ON" if active else "OFF"
         self._append_output(f"PPS {state}: freq={freq_hz}Hz, pulse={pulse_us}us")
         self._run_ubxtool(f"-c {cmd_str}")
+
+    def _set_baud_rate(self, speed: int) -> None:
+        """Set the receiver serial port baud rate and update gpsd."""
+        device = self._device_path
+        self._append_output(f"Setting baud rate to {speed}...")
+
+        def run():
+            try:
+                # Step 1: Tell the receiver to switch baud rate
+                result = subprocess.run(
+                    ["ubxtool", "-P", self._proto_ver, "-S", str(speed)],
+                    capture_output=True, text=True, timeout=10,
+                )
+                output = result.stdout.strip()
+                if result.stderr.strip():
+                    output += "\n" + result.stderr.strip()
+                if output:
+                    self.app.call_from_thread(self._append_output, output)
+
+                # Step 2: Tell gpsd the new speed so it can talk to the receiver
+                if device:
+                    gpsctl_cmd = ["gpsctl", "-s", str(speed), device]
+                else:
+                    gpsctl_cmd = ["gpsctl", "-s", str(speed)]
+                result = subprocess.run(
+                    gpsctl_cmd,
+                    capture_output=True, text=True, timeout=10,
+                )
+                if result.returncode == 0:
+                    self.app.call_from_thread(
+                        self._append_output,
+                        f"Baud rate set to {speed} on {device or 'default device'}",
+                    )
+                else:
+                    err = result.stderr.strip() or result.stdout.strip()
+                    self.app.call_from_thread(
+                        self._append_output,
+                        f"gpsctl: {err}" if err else f"gpsctl returned {result.returncode}",
+                    )
+            except FileNotFoundError as e:
+                self.app.call_from_thread(
+                    self._append_output, f"Error: {e.filename} not found"
+                )
+            except subprocess.TimeoutExpired:
+                self.app.call_from_thread(self._append_output, "Error: command timed out")
+            except Exception as e:
+                self.app.call_from_thread(self._append_output, f"Error: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _run_ubxtool(self, args: str) -> None:
         """Run ubxtool in a background thread."""

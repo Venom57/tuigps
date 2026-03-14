@@ -145,6 +145,11 @@ class GPSData:
     # TOFF history (last N offset samples in seconds, computed on gpsd thread)
     toff_samples: list[float] = field(default_factory=list)
 
+    # Armed TOFF result: single-shot measurement (offset in seconds, or NaN)
+    toff_armed_offset: float = float("nan")
+    toff_armed_gps_time: str = ""
+    toff_armed_sys_time: float = 0.0
+
     # Satellites
     satellites: list[SatelliteInfo] = field(default_factory=list)
     satellites_used: int = 0
