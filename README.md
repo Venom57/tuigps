@@ -13,6 +13,10 @@ Terminal UI GPS monitoring tool built with [Textual](https://textual.textualize.
 - **Satellites** — detailed table of all visible satellites with constellation breakdown
 - **Timing** — GPS time, PPS offset and quality, TOFF, leap seconds, time accuracy
 - **Device Config** — u-blox 8 configuration via ubxtool: platform model, nav rate, power mode, PPS, constellation enable/disable, and raw command input
+- **NMEA Viewer** — live stream of raw NMEA sentences with filtering by type (GGA, RMC, GSA, GSV, VTG, GLL) and pause/resume
+- **GPS Logging** — log position fixes to GPX and CSV files with `l` key
+- **Position Hold** — accumulate fixes and compute position statistics (mean, std dev, CEP50/CEP95) with `h` key
+- **Clock Sync** — set system clock from GPS time, with PPS-disciplined mode for sub-millisecond accuracy via kernel PPS ioctl
 - **Google Maps** — open current position in browser with `m` key or clickable link
 - **Settings** — gpsd host/port, unit system (metric/imperial/nautical), coordinate format (DD/DMS/DDM), constellation filtering
 - **Theming** — cycle through Textual themes with `t`, toggle dark/light with `d`
@@ -58,6 +62,8 @@ python -m tuigps
 | `r` | Reconnect to gpsd    |
 | `u` | Cycle units          |
 | `m` | Open Google Maps     |
+| `l` | Toggle GPS logging   |
+| `h` | Toggle position hold |
 
 ### Testing with simulated GPS
 
@@ -71,6 +77,7 @@ gpsfake -c 0.5 /usr/share/gpsd/sample.nmea
 - [Satellites](docs/satellites.md) — satellite details table
 - [Timing](docs/timing.md) — PPS and precision timing
 - [Device Configuration](docs/device.md) — u-blox 8 receiver settings
+- [NMEA Viewer](docs/nmea.md) — raw NMEA sentence stream
 
 ## Architecture
 

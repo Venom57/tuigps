@@ -7,7 +7,7 @@ The Dashboard is the main view of tuigps, providing a comprehensive overview of 
 ## Panels
 
 ### Position
-Displays current latitude, longitude, altitude (HAE and MSL), geoid separation, and a clickable Google Maps link when a fix is available.
+Displays current latitude, longitude, altitude (HAE and MSL), geoid separation, and a clickable Google Maps link when a fix is available. When position hold is active, shows averaged position, standard deviation (N/S, E/W, altitude), and CEP50/CEP95 statistics.
 
 ### Fix Quality
 Shows fix mode (No Fix / 2D / 3D), fix status (GPS, DGPS, RTK, PPS, etc.), satellites used vs visible, and DOP values (HDOP, VDOP, PDOP).
@@ -29,6 +29,10 @@ Shows the connected GPS device path, driver, baud rate, and update cycle.
 
 ### Time & Timing
 Displays current GPS date and time in UTC, time error estimate (ept), and leap seconds.
+
+## Status Bar
+
+The bottom status bar shows key bindings on the left, activity badges in the middle (REC when logging, HOLD when averaging), and GPS status on the right including constellation breakdown (e.g., "4GP+2GA/11sv"), device path, fix mode, and status.
 
 ## Key Bindings
 

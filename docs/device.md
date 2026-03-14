@@ -34,12 +34,17 @@ Configures the Pulse Per Second timing output:
 
 - **PPS Frequency** — Output pulse rate (1 Hz to 10 kHz)
 - **PPS Duration** — Pulse width (10 us to 100 ms)
-- **Apply PPS** — Sends the selected frequency and duration to the receiver
+- **Apply PPS** — Sends a UBX-CFG-TP5 message with the selected frequency and duration
 - **Disable PPS** — Turns off the timepulse output
 - **Read PPS** — Reads current CFG-TP5 configuration from the receiver
 
 ### Constellations
 Toggle buttons to enable/disable GNSS constellations on the receiver. Green indicates enabled. Available constellations: GPS, GLONASS, GALILEO, BEIDOU, SBAS, QZSS.
+
+### System Clock
+
+- **Set Clock (GPS)** — Sets the system clock from the latest GPS time, compensating for fix age. Uses D-Bus timedated (no sudo required on most desktop systems), with timedatectl and sudo -n fallbacks.
+- **Set Clock (PPS)** — PPS-disciplined clock sync for sub-millisecond accuracy. Blocks on the kernel PPS ioctl (`PPS_FETCH`) to capture the exact timestamp of the next PPS pulse edge, computes the offset between the kernel timestamp and the GPS second the pulse marks, then applies a relative adjustment via D-Bus SetTime. Requires a `/dev/pps*` device (e.g., `pps_gpio` or `pps_ldisc` kernel module).
 
 ### Utility Buttons
 - **Save Config** — Save current configuration to receiver flash (persists across power cycles)
