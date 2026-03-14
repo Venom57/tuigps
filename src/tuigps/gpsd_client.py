@@ -228,6 +228,37 @@ class GPSDClient:
         d.ecefvy = self._safe_float(f.ecefvy)
         d.ecefvz = self._safe_float(f.ecefvz)
 
+        # Compute TOFF: GPS time vs system clock
+        # gpsd only sends TOFF messages with PPS hardware; we compute it here
+        # so it always works when there's a GPS time in the TPV.
+        if d.time:
+            try:
+                from datetime import datetime, timezone
+
+                ts = d.time.replace("T", " ").replace("Z", "")
+                if "." in ts:
+                    gps_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f")
+                else:
+                    gps_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                gps_dt = gps_dt.replace(tzinfo=timezone.utc)
+                gps_epoch = gps_dt.timestamp()
+                sys_epoch = time.time()
+
+                # Split into sec + nsec for TOFFData
+                gps_sec = int(gps_epoch)
+                gps_nsec = (gps_epoch - gps_sec) * 1e9
+                sys_sec = int(sys_epoch)
+                sys_nsec = (sys_epoch - sys_sec) * 1e9
+
+                d.toff = TOFFData(
+                    real_sec=float(gps_sec),
+                    real_nsec=gps_nsec,
+                    clock_sec=float(sys_sec),
+                    clock_nsec=sys_nsec,
+                )
+            except Exception:
+                pass
+
     def _extract_sky(self, s, d: GPSData) -> None:
         """Extract SKY (satellite) data."""
         # DOP values from the session object
