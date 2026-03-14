@@ -157,6 +157,8 @@ class DeviceConfig(Vertical):
                 yield Button("Cold Boot", id="btn-coldboot", variant="error")
                 yield Button("Read Nav", id="btn-read", variant="default")
                 yield Button("Read Rate", id="btn-read-rate", variant="default")
+            with Horizontal(classes="config-row"):
+                yield Button("Set System Clock from GPS", id="btn-set-clock", variant="warning")
 
             with Horizontal(classes="config-row"):
                 yield Label("ubxtool cmd:    ", classes="config-label")
@@ -203,6 +205,8 @@ class DeviceConfig(Vertical):
             self._run_ubxtool("-p CFG-RATE")
         elif btn_id == "btn-gnss-read":
             self._run_ubxtool("-p CFG-GNSS")
+        elif btn_id == "btn-set-clock":
+            self._set_system_clock()
         elif btn_id == "btn-run-cmd":
             inp = self.query_one("#input-cmd", Input)
             if inp.value.strip():
@@ -229,6 +233,50 @@ class DeviceConfig(Vertical):
                     btn.variant = "default"
             except Exception:
                 pass
+
+    def _set_system_clock(self) -> None:
+        """Set the system clock from current GPS time."""
+        if not self._data or not self._data.time:
+            self._append_output("Error: no GPS time available")
+            return
+
+        gps_time = self._data.time
+        self._append_output(f"Setting system clock to GPS time: {gps_time}")
+
+        def run():
+            try:
+                # Try timedatectl first (systemd), fall back to date -s
+                # Normalize ISO 8601 time for date command
+                time_str = gps_time.replace("T", " ").replace("Z", "")
+                result = subprocess.run(
+                    ["sudo", "-n", "date", "-u", "-s", time_str],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if result.returncode == 0:
+                    output = f"System clock set to: {result.stdout.strip()}"
+                else:
+                    # sudo -n failed (needs password), try with prompt
+                    result = subprocess.run(
+                        ["sudo", "date", "-u", "-s", time_str],
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                    )
+                    if result.returncode == 0:
+                        output = f"System clock set to: {result.stdout.strip()}"
+                    else:
+                        output = f"Error: {result.stderr.strip()}"
+                self.app.call_from_thread(self._append_output, output)
+            except subprocess.TimeoutExpired:
+                self.app.call_from_thread(
+                    self._append_output, "Error: command timed out (sudo may need a password)"
+                )
+            except Exception as e:
+                self.app.call_from_thread(self._append_output, f"Error: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _build_tp5_cmd(self, freq_hz: int = 1, pulse_us: int = 100000, active: bool = True) -> str:
         """Build a UBX-CFG-TP5 command string for ubxtool -c.
