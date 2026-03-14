@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import ctypes
+import fcntl
+import glob
 import os
 import struct
 import subprocess
@@ -13,6 +16,41 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.widgets import Button, Input, Label, RichLog, Select
 
 from ..data_model import GPSData
+
+
+# ── Linux kernel PPS ioctl structures (from <linux/pps.h>) ──
+
+class _PPSKTime(ctypes.Structure):
+    _fields_ = [
+        ("sec", ctypes.c_int64),
+        ("nsec", ctypes.c_int32),
+        ("flags", ctypes.c_uint32),
+    ]
+
+
+class _PPSKInfo(ctypes.Structure):
+    _fields_ = [
+        ("assert_sequence", ctypes.c_uint32),
+        ("clear_sequence", ctypes.c_uint32),
+        ("assert_tu", _PPSKTime),
+        ("clear_tu", _PPSKTime),
+        ("current_mode", ctypes.c_int32),
+    ]
+
+
+class _PPSFData(ctypes.Structure):
+    _fields_ = [
+        ("info", _PPSKInfo),
+        ("timeout", _PPSKTime),
+    ]
+
+
+def _iowr(type_char: str, nr: int, size: int) -> int:
+    """Compute _IOWR ioctl number (Linux x86_64)."""
+    return (3 << 30) | (size << 16) | (ord(type_char) << 8) | nr
+
+
+_PPS_FETCH = _iowr("p", 0xA4, ctypes.sizeof(_PPSFData))
 
 
 # u-blox 8 dynamic platform models
@@ -160,7 +198,8 @@ class DeviceConfig(Vertical):
                 yield Button("Read Nav", id="btn-read", variant="default")
                 yield Button("Read Rate", id="btn-read-rate", variant="default")
             with Horizontal(classes="config-row"):
-                yield Button("Set System Clock from GPS", id="btn-set-clock", variant="warning")
+                yield Button("Set Clock (GPS)", id="btn-set-clock", variant="warning")
+                yield Button("Set Clock (PPS)", id="btn-pps-sync", variant="warning")
 
             with Horizontal(classes="config-row"):
                 yield Label("ubxtool cmd:    ", classes="config-label")
@@ -209,6 +248,8 @@ class DeviceConfig(Vertical):
             self._run_ubxtool("-p CFG-GNSS")
         elif btn_id == "btn-set-clock":
             self._set_system_clock()
+        elif btn_id == "btn-pps-sync":
+            self._pps_sync_clock()
         elif btn_id == "btn-run-cmd":
             inp = self.query_one("#input-cmd", Input)
             if inp.value.strip():
@@ -316,6 +357,159 @@ class DeviceConfig(Vertical):
                 self.app.call_from_thread(self._append_output, output)
             except Exception as e:
                 self.app.call_from_thread(self._append_output, f"Error: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    @staticmethod
+    def _find_pps_device() -> str | None:
+        """Return the first available /dev/pps* device, or None."""
+        devices = sorted(glob.glob("/dev/pps*"))
+        return devices[0] if devices else None
+
+    @staticmethod
+    def _wait_for_pps(pps_path: str, timeout_sec: int = 3) -> tuple[int, int, int] | None:
+        """Wait for next PPS assert edge via kernel ioctl.
+
+        Returns (kernel_sec, kernel_nsec, sequence) or None on timeout/error.
+        """
+        fd = None
+        try:
+            fd = os.open(pps_path, os.O_RDONLY)
+            fdata = _PPSFData()
+            fdata.timeout.sec = timeout_sec
+            fdata.timeout.nsec = 0
+            fdata.timeout.flags = 0x01  # PPS_CAPTUREASSERT
+            fcntl.ioctl(fd, _PPS_FETCH, fdata)
+            info = fdata.info
+            return (info.assert_tu.sec, info.assert_tu.nsec, info.assert_sequence)
+        except OSError:
+            return None
+        finally:
+            if fd is not None:
+                os.close(fd)
+
+    def _pps_sync_clock(self) -> None:
+        """Set system clock precisely using PPS pulse edge timing.
+
+        Flow:
+        1. Estimate which GPS second the next PPS pulse will mark
+        2. Block on PPS_FETCH ioctl (kernel captures timestamp at interrupt)
+        3. Compute offset = GPS_second - kernel_timestamp
+        4. Apply relative adjustment via D-Bus SetTime
+        The delay between ioctl return and SetTime cancels out mathematically.
+        """
+        if not self._data or not self._data.time:
+            self._append_output("Error: no GPS time available for PPS sync")
+            return
+
+        pps_dev = self._find_pps_device()
+        if not pps_dev:
+            self._append_output(
+                "Error: no PPS device found (/dev/pps*)\n"
+                "  Tip: modprobe pps_gpio or pps_ldisc, or check GPS wiring"
+            )
+            return
+
+        gps_time_str = self._data.time
+        last_seen = self._data.last_seen
+        self._append_output(f"PPS sync: waiting for pulse on {pps_dev}...")
+
+        def run():
+            try:
+                from datetime import datetime, timezone
+
+                # Parse GPS time
+                ts = gps_time_str.replace("T", " ").replace("Z", "")
+                if "." in ts:
+                    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f")
+                else:
+                    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                dt = dt.replace(tzinfo=timezone.utc)
+                gps_epoch = dt.timestamp()
+
+                # Estimate current GPS time to predict which second the pulse marks
+                elapsed = time.time() - last_seen  # true elapsed (system clock based)
+                current_gps = gps_epoch + elapsed
+                # Next whole GPS second (the one the PPS pulse will mark)
+                target_sec = int(current_gps) + 1
+
+                # Block until PPS pulse (kernel captures CLOCK_REALTIME at interrupt)
+                pps = self._wait_for_pps(pps_dev, timeout_sec=3)
+                if pps is None:
+                    self.app.call_from_thread(
+                        self._append_output,
+                        f"Error: PPS fetch failed on {pps_dev} (timeout or permission denied)\n"
+                        f"  Check: ls -la {pps_dev}  (need read permission)",
+                    )
+                    return
+
+                kern_sec, kern_nsec, seq = pps
+
+                # After pulse: refine target using post-pulse GPS time estimate
+                elapsed_after = time.time() - last_seen
+                current_gps_after = gps_epoch + elapsed_after
+                target_sec = round(current_gps_after)
+
+                # Offset = where GPS says we should be - where kernel clock was at pulse
+                # offset_usec > 0 means system clock is behind GPS
+                offset_usec = (
+                    target_sec * 1_000_000
+                    - kern_sec * 1_000_000
+                    - kern_nsec // 1_000
+                )
+
+                offset_ms = offset_usec / 1000.0
+                self.app.call_from_thread(
+                    self._append_output,
+                    f"PPS pulse #{seq}: kernel={kern_sec}.{kern_nsec:09d}\n"
+                    f"  GPS target second: {target_sec}\n"
+                    f"  Clock offset: {offset_ms:+.3f} ms",
+                )
+
+                # Disable NTP
+                subprocess.run(
+                    ["timedatectl", "set-ntp", "false"],
+                    capture_output=True, text=True, timeout=5,
+                )
+
+                # Apply relative offset via D-Bus (delay since PPS cancels out)
+                result = subprocess.run(
+                    [
+                        "busctl", "call", "org.freedesktop.timedate1",
+                        "/org/freedesktop/timedate1",
+                        "org.freedesktop.timedate1",
+                        "SetTime", "xbb", str(offset_usec), "true", "true",
+                    ],
+                    capture_output=True, text=True, timeout=10,
+                )
+
+                if result.returncode == 0:
+                    self.app.call_from_thread(
+                        self._append_output,
+                        f"System clock adjusted by {offset_ms:+.3f} ms (PPS-disciplined)",
+                    )
+                else:
+                    # Fallback: compute absolute time and use sudo -n date
+                    abs_usec = target_sec * 1_000_000
+                    abs_dt = datetime.fromtimestamp(target_sec, tz=timezone.utc)
+                    utc_str = abs_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    result = subprocess.run(
+                        ["sudo", "-n", "date", "-u", "-s", utc_str],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    if result.returncode == 0:
+                        self.app.call_from_thread(
+                            self._append_output,
+                            f"System clock set to {utc_str} UTC (sudo fallback, ~1s precision)",
+                        )
+                    else:
+                        self.app.call_from_thread(
+                            self._append_output,
+                            f"Error: busctl: {result.stderr.strip()}\n"
+                            f"  Could not apply PPS offset",
+                        )
+            except Exception as e:
+                self.app.call_from_thread(self._append_output, f"PPS sync error: {e}")
 
         threading.Thread(target=run, daemon=True).start()
 
