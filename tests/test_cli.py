@@ -117,8 +117,9 @@ def test_version(capsys):
 class FakeApp:
     instances: list[FakeApp] = []
 
-    def __init__(self, host=None, port=None):
+    def __init__(self, host=None, port=None, config=None, config_path=None):
         self.host, self.port, self.ran = host, port, False
+        self.config, self.config_path = config, config_path
         FakeApp.instances.append(self)
 
     def run(self):

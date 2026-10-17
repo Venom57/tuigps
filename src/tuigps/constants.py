@@ -11,6 +11,10 @@ GNSS_NAMES: dict[int, str] = {
     7: "NavIC",
 }
 
+# Stable lower-case keys (config file, settings, display filter)
+GNSS_KEYS: dict[int, str] = {gid: name.lower() for gid, name in GNSS_NAMES.items()}
+GNSS_IDS: dict[str, int] = {key: gid for gid, key in GNSS_KEYS.items()}
+
 GNSS_SHORT: dict[int, str] = {
     0: "GP",
     1: "SB",

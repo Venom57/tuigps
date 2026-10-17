@@ -15,7 +15,8 @@ Terminal UI GPS monitoring tool using gpsd.
   - `gpsd_client.py` — threaded native gpsd client (TCP, `?WATCH`, JSON + raw NMEA)
   - `data_model.py` — dataclasses for GPS state
   - `constants.py` — GNSS names, colors, status maps
-  - `formatting.py` — NaN-safe formatting helpers
+  - `formatting.py` — NaN-safe formatting and unit-conversion helpers
+  - `config.py` — persistent settings (`Config` dataclass, JSON load/save, validators)
   - `screens/` — Textual screens (main dashboard, settings modal)
   - `widgets/` — individual display panels
 
@@ -28,6 +29,7 @@ Terminal UI GPS monitoring tool using gpsd.
 - The client mutates a private working `GPSData` and publishes shallow-copy snapshots to `on_update`; it always replaces nested objects/lists, never mutates them in place, so snapshots never change after publication
 - UI refreshes are coalesced to at most `UI_REFRESH_HZ` (10 Hz) plus a 1 s heartbeat; clock sync/hold/logging run on the gpsd thread on each new TPV epoch (`tpv_seq`)
 - Tests never touch a real gpsd: the default port is patched to a refusing port, and `tests/fake_gpsd.py` provides a scriptable fake gpsd TCP server
+- Settings persist in `$XDG_CONFIG_HOME/tuigps/config.json` (`--config PATH` overrides). `config.load()` never raises (bad fields fall back to defaults with a warning); `config.save()` is atomic. The app saves on Settings Apply and on the `t`/`d`/`u` keys. CLI args and `GPSD_HOST`/`GPSD_PORT` override the saved host/port for one session and are not written back unless changed in Settings. Tests get a temp `XDG_CONFIG_HOME` from an autouse fixture
 
 ## Commands
 - `pip install -e .` — install in dev mode

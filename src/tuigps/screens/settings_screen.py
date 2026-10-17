@@ -108,7 +108,7 @@ class SettingsScreen(ModalScreen[dict | None]):
                 "port": self.query_one("#input-port", Input).value,
                 "units": self.query_one("#select-units", Select).value,
                 "coord_format": self.query_one("#select-coord", Select).value,
-                "enabled_gnss": enabled,
+                "display_gnss": sorted(enabled),
             }
             self.dismiss(result)
         else:

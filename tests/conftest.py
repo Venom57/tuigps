@@ -41,6 +41,20 @@ def _no_real_gpsd(monkeypatch, refused_port):
     monkeypatch.setattr(gpsd_client, "DEFAULT_PORT", str(refused_port))
 
 
+@pytest.fixture(autouse=True)
+def config_home(tmp_path_factory, monkeypatch) -> Path:
+    """Never read or write the real ~/.config: XDG_CONFIG_HOME is a temp dir."""
+    home = tmp_path_factory.mktemp("xdg-config")
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home))
+    return home
+
+
+@pytest.fixture
+def config_file(config_home) -> Path:
+    """The default config file path inside the temp XDG_CONFIG_HOME."""
+    return config_home / "tuigps" / "config.json"
+
+
 @pytest.fixture
 def fake_gpsd():
     """A running fake gpsd server (see tests/fake_gpsd.py)."""

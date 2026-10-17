@@ -16,7 +16,9 @@ from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Button, Header, TabbedContent, TabPane
 
+from . import config as config_mod
 from .clock_sync import set_clock_from_gps
+from .config import Config
 from .data_model import GPSData
 from .gps_logger import GPSLogger
 from .gpsd_client import GPSDClient
@@ -80,15 +82,31 @@ class TuiGPS(App):
 
     ENABLE_COMMAND_PALETTE = False
 
-    def __init__(self, host: str | None = None, port: str | int | None = None):
+    def __init__(
+        self,
+        host: str | None = None,
+        port: str | int | None = None,
+        config: Config | None = None,
+        config_path=None,
+    ):
+        """``host``/``port`` override the config file for this session only.
+
+        ``config`` defaults to loading ``config_path`` (default: the XDG path);
+        changes made in the app are saved back to ``config_path``.
+        """
         super().__init__()
-        self._gpsd = GPSDClient(host=host, port=port)
+        self._config_path = config_path
+        self._config = config_mod.load(config_path) if config is None else config
+        cfg = self._config
+        self._gpsd = GPSDClient(
+            host=cfg.host if host is None else host,
+            port=cfg.port if port is None else port,
+        )
         self._gps_data = GPSData()
-        self._units = "metric"
-        self._coord_format = "dd"
+        self._units = cfg.units
+        self._coord_format = cfg.coord_format
         self._theme_list: list[str] = []
         self._theme_index = 0
-        self._enabled_gnss: set[str] = {"gps"}
         self._gps_logger = GPSLogger()
         self._hold = PositionHold()
         self._armed_clock_set = False
@@ -154,11 +172,16 @@ class TuiGPS(App):
     def on_mount(self) -> None:
         self._cache_widgets()
 
-        # Build sorted theme list, default to textual-dark
+        # Sorted theme list; start with the configured theme
         self._theme_list = sorted(self.available_themes.keys())
-        self.theme = "textual-dark"
-        if "textual-dark" in self._theme_list:
-            self._theme_index = self._theme_list.index("textual-dark")
+        theme = self._config.theme
+        if theme not in self._theme_list:
+            self._config.load_warnings.append(f"unknown theme {theme!r}; using the default")
+            theme = config_mod.DEFAULT_THEME
+        self._set_theme(theme)
+
+        for warning in self._config.load_warnings:
+            self.notify(f"Config: {warning}", severity="warning", timeout=6)
 
         # Start gpsd connection
         self._gpsd.start(
@@ -429,33 +452,68 @@ class TuiGPS(App):
 
     # ─── Actions ─────────────────────────────────────────────
 
+    # ─── Configuration ───────────────────────────────────────
+
+    def _set_theme(self, theme: str) -> None:
+        self.theme = theme
+        if theme in self._theme_list:
+            self._theme_index = self._theme_list.index(theme)
+
+    def _save_config(self) -> None:
+        """Write the current settings to the config file (errors are notified)."""
+        cfg = self._config
+        cfg.units = self._units
+        cfg.coord_format = self._coord_format
+        cfg.theme = self.theme
+        try:
+            config_mod.save(cfg, self._config_path)
+        except OSError as exc:
+            log.warning("cannot save config: %s", exc)
+            self.notify(f"Cannot save settings: {exc}", severity="error", timeout=5)
+
     def action_cycle_theme(self) -> None:
         """Cycle through available Textual themes."""
         if not self._theme_list:
             return
-        self._theme_index = (self._theme_index + 1) % len(self._theme_list)
-        self.theme = self._theme_list[self._theme_index]
+        self._set_theme(self._theme_list[(self._theme_index + 1) % len(self._theme_list)])
+        self._save_config()
         self.notify(f"Theme: {self.theme}", timeout=2)
+
+    def action_toggle_dark(self) -> None:
+        """Toggle between textual-dark and textual-light (and remember it)."""
+        self._set_theme("textual-dark" if self.theme == "textual-light" else "textual-light")
+        self._save_config()
 
     def action_cycle_units(self) -> None:
         """Cycle through unit systems."""
-        cycle = ["metric", "imperial", "nautical"]
+        cycle = list(config_mod.UNITS)
         idx = cycle.index(self._units) if self._units in cycle else 0
         self._units = cycle[(idx + 1) % len(cycle)]
+        self._save_config()
         self.notify(f"Units: {self._units}", timeout=2)
         self._refresh_ui()
 
     def action_open_settings(self) -> None:
         """Open the settings modal."""
+        session_host, session_port = self._gpsd.host, self._gpsd.port
 
         def on_settings_result(result: dict | None) -> None:
             if result is None:
                 return
-            new_host = result.get("host", "127.0.0.1")
-            new_port = result.get("port", "2947")
+            cfg = self._config
+            new_host = result.get("host", session_host)
+            new_port = result.get("port", session_port)
             self._units = result.get("units", self._units)
             self._coord_format = result.get("coord_format", self._coord_format)
-            self._enabled_gnss = result.get("enabled_gnss", self._enabled_gnss)
+            if "display_gnss" in result:
+                cfg.display_gnss = list(result["display_gnss"])
+            # A server given on the command line (or by GPSD_HOST/GPSD_PORT) is
+            # only saved when the user actually changes it here.
+            if new_host != session_host:
+                cfg.host = new_host
+            if new_port != session_port:
+                cfg.port = int(new_port)
+            self._save_config()
 
             # Reconnect if host/port changed
             if new_host != self._gpsd.host or new_port != self._gpsd.port:
@@ -474,11 +532,11 @@ class TuiGPS(App):
 
         self.push_screen(
             SettingsScreen(
-                host=self._gpsd.host,
-                port=self._gpsd.port,
+                host=session_host,
+                port=session_port,
                 units=self._units,
                 coord_format=self._coord_format,
-                enabled_gnss=self._enabled_gnss,
+                enabled_gnss=set(self._config.display_gnss),
             ),
             callback=on_settings_result,
         )

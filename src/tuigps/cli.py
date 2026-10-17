@@ -1,12 +1,15 @@
-"""Command-line interface: ``tuigps [server] [--host HOST] [--port PORT]``."""
+"""Command-line interface: ``tuigps [server] [--host HOST] [--port PORT] [--config PATH]``."""
 
 from __future__ import annotations
 
 import argparse
 import os
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 
 from . import __version__
+from . import config as config_mod
+from .config import Config, check_port
 
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 2947
@@ -40,24 +43,13 @@ def parse_server(spec: str) -> tuple[str | None, str | None]:
     return spec, None
 
 
-def check_port(value: str | int) -> str:
-    """Validate a TCP port (1-65535); returns it normalised as a string."""
-    try:
-        port = int(str(value).strip(), 10)
-    except ValueError:
-        raise ValueError(f"invalid port {value!r}") from None
-    if not 1 <= port <= 65535:
-        raise ValueError(f"port {port} out of range (1-65535)")
-    return str(port)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="tuigps",
         description="Terminal UI GPS monitor for gpsd.",
         epilog=(
-            "The server defaults to $GPSD_HOST / $GPSD_PORT, else "
-            f"{DEFAULT_HOST}:{DEFAULT_PORT}. Examples: tuigps gpsbox, "
+            "The server defaults to $GPSD_HOST / $GPSD_PORT, then the config "
+            f"file, else {DEFAULT_HOST}:{DEFAULT_PORT}. Examples: tuigps gpsbox, "
             "tuigps 192.168.1.20:2947, tuigps [::1]:2947"
         ),
     )
@@ -67,21 +59,33 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--host", help="gpsd host name or address")
     parser.add_argument("--port", help="gpsd TCP port (1-65535)")
+    parser.add_argument(
+        "--config", metavar="PATH",
+        help=f"config file (default: {config_mod.default_path()})",
+    )
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     return parser
 
 
 def parse_args(
-    argv: Sequence[str] | None = None, environ: Mapping[str, str] | None = None
+    argv: Sequence[str] | None = None,
+    environ: Mapping[str, str] | None = None,
+    config: Config | None = None,
 ) -> argparse.Namespace:
-    """Parse arguments into ``host`` and ``port`` (a validated string).
+    """Parse arguments into ``host``, ``port`` (a validated string),
+    ``config`` (the loaded Config) and ``config_path``.
 
     Precedence: --host/--port, then the positional server, then the
-    GPSD_HOST / GPSD_PORT environment variables, then the defaults.
+    GPSD_HOST / GPSD_PORT environment variables, then the config file,
+    then the defaults. ``config`` (if given) is used instead of loading
+    the file named by --config (or the default path).
     """
     parser = build_parser()
     args = parser.parse_args(argv)
     env = os.environ if environ is None else environ
+    config_path = Path(args.config).expanduser() if args.config else config_mod.default_path()
+    if config is None:
+        config = config_mod.load(config_path)
 
     pos_host = pos_port = None
     if args.server is not None:
@@ -94,13 +98,15 @@ def parse_args(
     if args.port is not None and pos_port is not None:
         parser.error("give the port either in the server argument or with --port, not both")
 
-    host = args.host or pos_host or env.get("GPSD_HOST") or DEFAULT_HOST
+    host = args.host or pos_host or env.get("GPSD_HOST") or config.host or DEFAULT_HOST
     if args.port is not None:
         port, source = args.port, "--port"
     elif pos_port is not None:
         port, source = pos_port, "server"
     elif env.get("GPSD_PORT"):
         port, source = env["GPSD_PORT"], "GPSD_PORT"
+    elif config.port is not None:
+        port, source = config.port, "config"
     else:
         port, source = DEFAULT_PORT, "default"
     try:
@@ -113,7 +119,7 @@ def parse_args(
         host = host[1:-1]  # --host [::1]
     if not host:
         parser.error("empty host")
-    return argparse.Namespace(host=host, port=port)
+    return argparse.Namespace(host=host, port=port, config=config, config_path=config_path)
 
 
 def main(argv: Sequence[str] | None = None) -> None:
@@ -121,4 +127,6 @@ def main(argv: Sequence[str] | None = None) -> None:
     args = parse_args(argv)
     from .app import TuiGPS  # imported late so --help/--version stay fast
 
-    TuiGPS(host=args.host, port=args.port).run()
+    TuiGPS(
+        host=args.host, port=args.port, config=args.config, config_path=args.config_path
+    ).run()

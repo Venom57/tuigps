@@ -9,6 +9,7 @@ by the fake gpsd server.
 from __future__ import annotations
 
 import asyncio
+import json
 import math
 import threading
 import time
@@ -338,13 +339,13 @@ async def test_settings_apply_same_host_keeps_client():
         screen = app.screen
         screen.query_one("#select-units", Select).value = "nautical"
         screen.query_one("#select-coord", Select).value = "ddm"
-        screen.query_one("#chk-gnss-galileo").value = True
+        screen.query_one("#chk-gnss-galileo").value = False
         screen.query_one("#btn-apply", Button).press()
         await pilot.pause()
         assert not isinstance(app.screen, SettingsScreen)
         assert app._units == "nautical"
         assert app._coord_format == "ddm"
-        assert app._enabled_gnss == {"gps", "galileo"}
+        assert "galileo" not in app._config.display_gnss and "gps" in app._config.display_gnss
         assert app._gpsd is client
 
 
@@ -765,3 +766,100 @@ def test_refresh_before_mount_is_a_no_op(make_gps_data):
     app._gps_data = make_gps_data()
     app._refresh_ui()
     app._deliver_nmea_batch(["$GPGGA,1*00"])
+
+
+# ─── Persistent configuration (U1) ────────────────────────────────────
+
+
+from tuigps import config as config_mod  # noqa: E402
+from tuigps.config import Config  # noqa: E402
+
+
+async def test_app_starts_with_saved_settings(config_file, make_gps_data):
+    config_mod.save(Config(units="imperial", coord_format="dms", theme="nord"))
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        assert app.theme == "nord"
+        assert app._theme_list[app._theme_index] == "nord"
+        assert (app._units, app._coord_format) == ("imperial", "dms")
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        plain = app.query_one("#w-position").render().plain
+        assert "164.9 ft" in plain and "47°36'22.32\"N" in plain
+
+
+async def test_config_warnings_are_notified(config_file):
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('{"units": "furlongs", "theme": "no-such-theme"}')
+    notes = []
+    app = TuiGPS()
+    app.notify = lambda message, **kw: notes.append((message, kw.get("severity")))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        assert app.theme == "textual-dark" and app._units == "metric"
+    assert [sev for _, sev in notes] == ["warning", "warning"]
+    assert "furlongs" in notes[0][0] and "no-such-theme" in notes[1][0]
+
+
+async def test_theme_and_units_keys_are_saved(config_file):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("u")
+        assert config_mod.load().units == "imperial"
+        await pilot.press("t")
+        assert config_mod.load().theme == app.theme != "textual-dark"
+        app._set_theme("nord")
+        await pilot.press("d")
+        assert app.theme == "textual-light"
+        assert config_mod.load().theme == "textual-light"
+        await pilot.press("d")
+        assert config_mod.load().theme == "textual-dark"
+        assert app._theme_list[app._theme_index] == "textual-dark"
+    saved = json.loads(config_file.read_text())
+    assert saved["host"] is None and saved["port"] is None
+
+
+async def test_explicit_config_path_is_used(tmp_path, config_file):
+    path = tmp_path / "mine.json"
+    config_mod.save(Config(units="nautical"), path)
+    app = TuiGPS(config_path=path)
+    async with app.run_test(size=SIZE) as pilot:
+        assert app._units == "nautical"
+        await pilot.press("u")
+    assert config_mod.load(path).units == "metric"
+    assert not config_file.exists()
+
+
+async def test_config_save_error_is_notified_not_fatal(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    notes = []
+    app = TuiGPS(config_path=blocker / "config.json")
+    app.notify = lambda message, **kw: notes.append((message, kw.get("severity")))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("u")
+        assert app.is_running and app._units == "imperial"
+    assert any(sev == "error" and "Cannot save settings" in m for m, sev in notes)
+
+
+async def test_cli_server_override_is_not_saved(config_file):
+    config_mod.save(Config(host="cfghost", port=3001))
+    app = TuiGPS(host="clihost", port="4000")
+    async with app.run_test(size=SIZE) as pilot:
+        assert (app._gpsd.host, app._gpsd.port) == ("clihost", "4000")
+        await pilot.press("u")  # saves the config...
+        await pilot.press("s")
+        await pilot.pause()
+        assert app.screen.query_one("#input-host", Input).value == "clihost"
+        app.screen.query_one("#btn-apply", Button).press()  # ...host/port unchanged
+        await pilot.pause()
+    saved = config_mod.load()
+    assert (saved.host, saved.port) == ("cfghost", 3001)
+    assert saved.units == "imperial"
+
+
+async def test_config_server_is_used_without_override(config_file):
+    config_mod.save(Config(host="cfghost", port=3001))
+    app = TuiGPS()
+    assert (app._gpsd.host, app._gpsd.port) == ("cfghost", "3001")
