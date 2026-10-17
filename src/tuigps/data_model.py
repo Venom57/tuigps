@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
+
+from .constants import STALE_AFTER
 
 
 class FixMode(IntEnum):
@@ -192,3 +195,20 @@ class GPSData:
         sec_diff = self.pps.real_sec - self.pps.clock_sec
         nsec_diff = self.pps.real_nsec - self.pps.clock_nsec
         return (sec_diff * 1_000_000) + (nsec_diff / 1_000)
+
+
+def staleness(data: GPSData | None, now: float | None = None) -> str:
+    """Why ``data`` should not be shown as live: "" when it is current.
+
+    Returns "CONNECTING", "DISCONNECTED", or "STALE <n>s" when the last gpsd
+    message is older than ``STALE_AFTER`` seconds. Connected without any
+    message yet is not stale (there is no data to mistake for live data).
+    """
+    if data is None or data.connection_state == "connecting":
+        return "CONNECTING" if data is not None else "DISCONNECTED"
+    if not data.connected:
+        return "DISCONNECTED"
+    if data.last_seen <= 0:
+        return ""
+    age = (time.time() if now is None else now) - data.last_seen
+    return f"STALE {int(age)}s" if age > STALE_AFTER else ""

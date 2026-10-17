@@ -278,3 +278,30 @@ NMEAViewer {
 SettingsScreen {
     align: center middle;
 }
+
+/* ─── Help modal ─── */
+
+HelpScreen {
+    align: center middle;
+}
+
+#help-dialog {
+    width: 90;
+    max-width: 100%;
+    height: auto;
+    max-height: 100%;
+    border: heavy $accent;
+    background: $surface;
+    padding: 0 1;
+    border-title-align: center;
+    border-title-style: bold;
+    border-subtitle-align: center;
+}
+
+#help-body {
+    height: auto;
+}
+
+#help-keys {
+    margin-bottom: 1;
+}

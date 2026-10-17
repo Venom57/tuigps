@@ -64,6 +64,11 @@ python -m tuigps
 | `m` | Open Google Maps     |
 | `l` | Toggle GPS logging   |
 | `h` | Toggle position hold |
+| `?` / `F1` | Help (all keys and tabs) |
+| `1`–`5` | Switch tab (Dashboard, Satellites, Timing, Device, NMEA) |
+
+Keys are inactive while typing in a text field. The status bar shows as many
+key hints as fit; on narrow terminals the rest are behind `?`.
 
 ### Testing with simulated GPS
 

@@ -152,7 +152,7 @@ WIDGETS = {
         },
     ),
     "status": (
-        ConnectionStatus,
+        lambda: ConnectionStatus(hints=[("q", "Quit"), ("?", "Help")], help_hint=("?", "Help")),
         " q ",
         {
             "none": ["DISCONNECTED"],

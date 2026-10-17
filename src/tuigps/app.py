@@ -24,6 +24,7 @@ from .formatting import fmt_distance
 from .gps_logger import GPSLogger
 from .gpsd_client import GPSDClient
 from .position_hold import PositionHold
+from .screens.help_screen import HelpScreen
 from .screens.settings_screen import SettingsScreen
 from .widgets.connection_status import ConnectionStatus
 from .widgets.constellation_panel import ConstellationPanel
@@ -61,6 +62,22 @@ TAB_WIDGETS: dict[str, tuple[str, ...]] = {
     "tab-nmea": (),  # NMEA is delivered in batches (see _drain_nmea)
 }
 
+# Tabs in display order: (pane id, title, description for the help screen).
+# Number keys 1-5 select them (see TuiGPS.BINDINGS).
+TABS: tuple[tuple[str, str, str], ...] = (
+    ("tab-dashboard", "Dashboard",
+     "Position, fix quality, velocity, sky plot, signal strength, error estimates, "
+     "device and time at a glance."),
+    ("tab-satellites", "Satellites",
+     "Per-constellation counts and a sortable table of every satellite in view."),
+    ("tab-timing", "Timing",
+     "GPS vs system time, PPS and TOFF offsets, and single-shot TOFF measurement."),
+    ("tab-device", "Device",
+     "u-blox receiver configuration via ubxtool, and setting the system clock from GPS."),
+    ("tab-nmea", "NMEA",
+     "Live raw NMEA sentences with filtering, pause and per-type statistics."),
+)
+
 
 class TuiGPS(App):
     """GPS monitoring terminal application."""
@@ -69,16 +86,28 @@ class TuiGPS(App):
     SUB_TITLE = "GPS Monitor"
     CSS_PATH = "app.tcss"
 
+    # The single source of truth for keys: the status bar hints (show=True)
+    # and the help screen (all of them) are generated from this list. The
+    # description is the short label; the tooltip is the help text.
     BINDINGS = [
-        Binding("q", "quit", "Quit"),
-        Binding("t", "cycle_theme", "Theme"),
-        Binding("d", "toggle_dark", "Dark/Light"),
-        Binding("s", "open_settings", "Settings"),
-        Binding("r", "reconnect", "Reconnect"),
-        Binding("u", "cycle_units", "Units"),
-        Binding("m", "open_maps", "Maps"),
-        Binding("l", "toggle_log", "Log"),
-        Binding("h", "toggle_hold", "Hold"),
+        Binding("q", "quit", "Quit", tooltip="Quit tuigps"),
+        Binding("t", "cycle_theme", "Theme", tooltip="Cycle through the color themes"),
+        Binding("d", "toggle_dark", "Dark/Light", tooltip="Switch between dark and light"),
+        Binding("s", "open_settings", "Settings",
+                tooltip="Server, units, coordinates, logging and constellation filter"),
+        Binding("r", "reconnect", "Reconnect", tooltip="Reconnect to gpsd now"),
+        Binding("u", "cycle_units", "Units", tooltip="Cycle metric, imperial and nautical units"),
+        Binding("m", "open_maps", "Maps", tooltip="Open the current position in Google Maps"),
+        Binding("l", "toggle_log", "Log", tooltip="Start or stop logging fixes (GPX or CSV)"),
+        Binding("h", "toggle_hold", "Hold",
+                tooltip="Start or stop position hold (averaged position and CEP)"),
+        Binding("question_mark", "help", "Help", key_display="?", tooltip="Show this help"),
+        Binding("f1", "help", "Help", show=False, tooltip="Show this help"),
+        *(
+            Binding(str(n), f"show_tab('{pane}')", title, show=False,
+                    tooltip=f"Show the {title} tab")
+            for n, (pane, title, _) in enumerate(TABS, start=1)
+        ),
     ]
 
     ENABLE_COMMAND_PALETTE = False
@@ -131,7 +160,7 @@ class TuiGPS(App):
 
     def compose(self) -> ComposeResult:
         yield Header()
-        with TabbedContent("Dashboard", "Satellites", "Timing", "Device", "NMEA"):
+        with TabbedContent(*(title for _, title, _ in TABS)):
             with TabPane("Dashboard", id="tab-dashboard"):
                 with VerticalScroll(id="dashboard-scroll"):
                     with Grid(id="dashboard-grid"):
@@ -158,7 +187,37 @@ class TuiGPS(App):
                 yield DeviceConfig(id="w-device-config")
             with TabPane("NMEA", id="tab-nmea"):
                 yield NMEAViewer(id="w-nmea")
-        yield ConnectionStatus(id="w-connection")
+        yield ConnectionStatus(
+            hints=self.key_hints(), help_hint=self.help_hint(), id="w-connection"
+        )
+
+    # ─── Keys and help ──────────────────────────────────────────
+
+    def _key_display(self, binding: Binding) -> str:
+        return binding.key_display or self.get_key_display(binding)
+
+    def key_hints(self) -> list[tuple[str, str]]:
+        """Status bar hints: ``(key, label)`` for every shown binding."""
+        return [(self._key_display(b), b.description) for b in self.BINDINGS if b.show]
+
+    def help_hint(self) -> tuple[str, str]:
+        """The hint that stands in for the hints that do not fit."""
+        binding = next(b for b in self.BINDINGS if b.action == "help" and b.show)
+        return self._key_display(binding), binding.description
+
+    def help_rows(self) -> list[tuple[str, str, str]]:
+        """Help screen rows: ``(key, description, details)`` for every binding."""
+        return [(self._key_display(b), b.description, b.tooltip) for b in self.BINDINGS]
+
+    def action_help(self) -> None:
+        """Show the help screen (key bindings and tabs)."""
+        tabs = [(str(n), title, text) for n, (_, title, text) in enumerate(TABS, start=1)]
+        self.push_screen(HelpScreen(self.help_rows(), tabs))
+
+    def action_show_tab(self, pane: str) -> None:
+        """Switch to a tab (number keys)."""
+        if self._tabs is not None:
+            self._tabs.active = pane
 
     def _cache_widgets(self) -> None:
         """Look the refreshed widgets up once, instead of on every refresh."""

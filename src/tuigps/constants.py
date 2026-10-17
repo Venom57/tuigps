@@ -104,3 +104,6 @@ def dop_rating(value: float) -> tuple[str, str]:
         if value < threshold:
             return label, color
     return "Poor", "red"
+
+# Data older than this (seconds since the last gpsd message) is shown as stale
+STALE_AFTER = 10.0
