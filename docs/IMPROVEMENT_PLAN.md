@@ -2,6 +2,78 @@
 
 Branch: `improvements/phased-overhaul` (from `master` @ `01c9bab`)
 
+## Status
+
+**All phases are complete** on `improvements/phased-overhaul`. The suite has
+721 tests (about 20 s in parallel with pytest-xdist), with 99.8% line and
+98.9% branch coverage. The plan's target was ≥ 85%. What is still open is
+the [manual verification on real hardware](#manual-verification-on-real-hardware)
+below.
+
+| Phase | Delivered | Commits |
+|-------|-----------|---------|
+| 0: Test foundation | Dev extras, pytest/coverage config, characterization and Pilot tests. Known bugs were recorded as strict xfails and new findings N1–N7 added to the plan. | `0502a77` `a33354d` `a80dcbb` |
+| 1: Correctness | PPS ioctl encoding and timeout (N2, N3), Python 3.10 syntax (N1), shared `parse_gps_time` (F11), per-command clock error labels (N5). Thread lifecycle with one stop event per run and a joined stop (F4), isolated callbacks (F3), gpsd TOFF precedence (N7). TPV epochs (`tpv_seq`, `tpv_received`) for hold, logging and fix age (F1, F2), altitude count (F12), valid GPX 1.1 (F6), non-overwriting logs (N7). NMEA pause/filter/stats (F7), DMS/DDM rounding (N4), signal chart budget (F13), `Select.NULL` (N6), `shlex` (F9), no silent `except: pass` (F15). | `1680000` `290df43` `4494097` `6875137` |
+| 2: Native client | stdlib gpsd JSON client replacing python3-gps (F14), immutable snapshots (F5), connection state, 2→30 s backoff and transition-only notifications (U2), CLI `tuigps [host[:port]] --host --port --version`. | `d7b47d0` `f6acd3f` `a0a1b43` |
+| 3: Performance | Non-blocking delivery (`call_soon_threadsafe`), coalesced ≤ 10 Hz UI ticks (P1, P2), batched NMEA (P5), active-tab refresh and repaint skipping (P3), cached sky plot background with style runs (13 ms → 0.4 ms) (P4), performance tests. | `e5019fe` `782cca5` `07c26dc` `be2b972` |
+| 4a: Config and settings | Config file with atomic save and tolerant load, `--config` (U1). Validated settings with log format and directory (U8), a working constellation display filter (F8), consistent units (F10), TOFF source label. | `32c4e84` `6734113` `ff8e8b7` `d473b23` |
+| 4b: UX | Help screen, `?`/F1, number keys 1–5, status bar hints generated from the bindings and given space by priority (U4, U6). Responsive 3/2/1-column dashboard (U5). Stale/disconnected panel tags (U3). Confirmation dialogs and Re-enable NTP (U7). Parallel test suite (pytest-xdist). | `87e1c5e` `d1651b7` `ba22860` `31b4648` `37ccd5b` |
+| 5: Tests, coverage, docs | NTP restored when setting the clock fails. Tests for the remaining error and edge paths, a review that tightened weak, flaky or duplicated tests, and an HTML coverage report. Fixed satellite health display and status bar counts. README, per-tab docs, new configuration and development docs, CLAUDE.md. | `86d5439` `3e028bd` `a13aec9` and this update |
+
+### Deviations from the original plan
+
+- **Phase 0's fake `gps` module was temporary.** Once the native client
+  landed (Phase 2), the tests switched to a scriptable fake gpsd TCP server
+  (`tests/fake_gpsd.py`). An autouse fixture points the default gpsd port at
+  a port that refuses connections, so no test can reach a real gpsd.
+- **Settings and the server.** A server given on the command line or in
+  `GPSD_HOST`/`GPSD_PORT` applies to the session only. It is written to the
+  config file only when changed in Settings. `host`/`port` are `null` in
+  the file until then. The plan said only "save host and port".
+- **The display filter is display-only.** The constellation checkboxes hide
+  satellites from the sky plot, signal chart and satellite table. Fix data,
+  used counts and the status bar are not filtered. The receiver's
+  constellations stay on the Device tab.
+- **The armed clock set stays on the gpsd thread** (Phase 3), as do hold and
+  logging, for minimum latency. Only UI delivery became non-blocking.
+- **Additions beyond the plan:**
+  - the TOFF source label, `gpsd TOFF` or `computed` (follow-up to N7)
+  - automatic NTP restore when setting the clock fails, with a missing
+    program or timeout counting as a failed method
+  - satellite health shown per gpsd's encoding (0 unknown, 1 OK,
+    2 unhealthy)
+  - the status bar's `0/Nsv` and `N used` forms
+  - pytest-xdist: the Pilot tests are CPU-bound, so the suite runs in
+    parallel (`addopts = "-n auto"`). pytest-xdist is therefore a required
+    dev dependency, and `-n0` runs serially.
+- **Screenshots were not regenerated.** `docs/screenshots/` are real-hardware
+  captures. The docs note where the UI has changed since they were taken.
+- **Not done:** the Device tab's constellation buttons still show what
+  tuigps last sent, not the receiver's state (there is no CFG-GNSS
+  parsing). `ubxtool` and `gpsctl` always talk to the local gpsd, even when
+  tuigps watches a remote one.
+
+### Manual verification on real hardware
+
+These paths are covered by mocks only, or depend on the environment, and
+need a manual check before merging:
+
+- [ ] **Live data:** real gpsd with a receiver. Dashboard values match `cgps`/`gpsmon`. Satellites, DOPs, errors and device info are correct. The fix and status bar look right in a 3D fix, without a fix, and indoors.
+- [ ] **NMEA:** the stream appears. Filter, pause/resume (no duplicates) and Clear work. The rate in the stats line matches the receiver's output.
+- [ ] **TOFF:** with a non-PPS receiver, `(computed)` with a plausible offset (tens to hundreds of ms). With a PPS-capable setup, `(gpsd TOFF)`. Arm TOFF fires once. Clear TOFF works.
+- [ ] **PPS display:** the PPS section shows offset, quality, precision and qErr after **Apply PPS**, and goes away after **Disable PPS** (confirm dialog).
+- [ ] **PPS clock sync:** with `/dev/pps0` from `pps_gpio` or `pps_ldisc`, (a) without read permission you get "PPS fetch failed … permission denied" and the clock is untouched; (b) after a udev rule or group change, the pulse is caught and the clock is stepped by the reported offset (compare `chronyc tracking` or `ntpdate -q`); (c) with no PPS device you get "no PPS device found".
+- [ ] **Clock set + NTP:** Set Clock (now) and Arm Clock Sync set the clock via busctl/polkit as a desktop user. The NTP label turns to `off`, and **Re-enable NTP** turns it back `on`. Make busctl and sudo fail (for example over SSH without polkit): the error lists each method, and NTP is re-enabled automatically if it was on.
+- [ ] **ubxtool device config:** Read Nav/Rate/PPS/GNSS show receiver output. Set Model/Rate/Power take effect (check with the Read buttons). Constellation enable/disable, then Read GNSS. Save Config and Cold Boot ask first and work. A raw command such as `-p MON-VER` works.
+- [ ] **Baud change:** 9600 → 115200 → 9600 keeps gpsd in contact (the device panel's baud follows). Note how to recover if one side does not switch.
+- [ ] **Older gpsd:** 3.17–3.22 (for example Debian/Ubuntu LTS packages). Legacy `alt`, SKY without `nSat`/`uSat`, and no TOFF reports. Check position, altitude and satellites.
+- [ ] **Remote and IPv6:** `tuigps gpsbox`, `tuigps 192.168.x.y:2947` and `tuigps [::1]:2947` against gpsd started with `-G` (listen on all addresses). Settings change the server (it reconnects and saves). An unreachable host gives one notification, and the countdown shows in the status bar.
+- [ ] **Outage:** stop and start gpsd while tuigps runs. Panels are tagged `[DISCONNECTED]` and then clear. There is one notification per outage, then "Connected to gpsd …".
+- [ ] **gpsfake:** `gpsfake -c 0.5 /usr/share/gpsd/sample.nmea` plays end to end (all tabs, logging to GPX/CSV, hold), and the GPX validates (`xmllint --schema gpx.xsd`).
+- [ ] **Terminals:** narrow (< 80) and medium (80–119) widths, light theme, and a slow SSH session (the coalesced refresh keeps it responsive).
+
+---
+
 This plan comes from a full read of the codebase (about 3.2k lines of Python and no tests) and a headless smoke run against Textual 8.2.8. The work is split into phases. Each phase is one or more work blocks, and each block is committed only after the full test suite passes.
 
 ---
