@@ -109,3 +109,29 @@ async def test_steady_stream_refresh_rate_is_capped(make_gps_data, monkeypatch):
         print(f"\nsteady 50 Hz: {len(refreshes)} refreshes in {elapsed:.2f} s")
         # <= 10 Hz coalesced ticks + 1 Hz heartbeat + slack
         assert len(refreshes) <= elapsed * (app_module.UI_REFRESH_HZ + 1) + 3
+
+
+def _min_time(fn, runs: int = 7) -> float:
+    best = float("inf")
+    for _ in range(runs):
+        t = time.perf_counter()
+        fn()
+        best = min(best, time.perf_counter() - t)
+    return best
+
+
+def test_sky_plot_render_is_faster_than_reference():
+    """P4: cached background + style runs vs. the original per-cell renderer."""
+    from tests.test_sky_plot import FixedSizeSkyPlot, random_satellites, reference_render
+    from tuigps.data_model import GPSData
+
+    data = GPSData(satellites=random_satellites(40, 7))
+    sky = FixedSizeSkyPlot(120, 40)
+    sky._data = data
+    sky.render()  # build the background once, as a mounted widget would
+    new = _min_time(sky.render)
+    old = _min_time(lambda: reference_render(data, 120, 40))
+    print(f"\nSkyPlot 120x40, 40 sats: reference {old * 1000:.2f} ms, new {new * 1000:.2f} ms "
+          f"({old / new:.1f}x)")
+    assert new * 2 <= old
+    assert new < 0.02  # generous absolute bound: well under one 10 Hz frame
