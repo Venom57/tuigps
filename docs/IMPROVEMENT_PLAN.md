@@ -38,6 +38,18 @@ This plan comes from a full read of the codebase (about 3.2k lines of Python and
 | F14 | A missing `python3-gps` causes a raw `ImportError` traceback at startup. The package can't be installed from PyPI, which forces the `sys.path` workaround. | `gpsd_client` |
 | F15 | Errors are silently swallowed (`except Exception: pass`) about 30 times, which hides bugs. | everywhere |
 
+### Additional findings from Phase 0 testing
+
+| # | Finding | Where |
+|---|---------|-------|
+| N1 | Backslashes inside f-string expressions are a **SyntaxError on Python 3.10 and 3.11**, so the app can't start on Python versions it claims to support. | `widgets/satellite_table.py` |
+| N2 | `PPS_FETCH` is encoded with `sizeof(struct pps_fdata)` instead of the pointer size used by `<linux/pps.h>`, so the ioctl fails with ENOTTY. **"Set Clock (PPS)" can never work.** | `widgets/device_config.py` |
+| N3 | `timeout.flags = 0x01` is `PPS_TIME_INVALID`, so the kernel ignores the timeout and waits forever when no pulse arrives. | `widgets/device_config.py` |
+| N4 | `fmt_coord` in DMS and DDM formats can display 60 seconds or 60 minutes (`10°59'60.00"N`). | `formatting.py` |
+| N5 | The final clock-sync error message labels sudo's stderr as "busctl". | `clock_sync.py`, `device_config.py` |
+| N6 | `Select.BLANK` doesn't exist in Textual 8 (the code should use `Select.NULL`). As a result, Set Model, Rate or Power sends `Select.NULL` to ubxtool, and **Set baud with nothing selected crashes the app**. | `widgets/device_config.py` |
+| N7 | TOFF computed from TPV messages overwrites real gpsd TOFF messages. Starting a log twice in the same second overwrites the first file. A fix with an empty timestamp is never logged. Before the first message arrives, the status bar shows "STALE (999s)". | `gpsd_client`, `gps_logger`, `connection_status` |
+
 ### User experience
 
 | # | Finding |
@@ -69,7 +81,8 @@ Each phase ends with a green test suite and at least one commit. Later phases bu
 * Add a headless Textual Pilot smoke test: the app mounts, every tab renders, keys work, and the settings modal opens and closes.
 * Record a baseline coverage report.
 
-### Phase 1: Correctness fixes (F1–F4, F6, F7, F9, F11–F13, F15)
+### Phase 1: Correctness fixes (F1–F4, F6, F7, F9, F11–F13, F15, N1–N7)
+* Fix Python 3.10 compatibility (N1), the PPS ioctl encoding and timeout (N2, N3), DMS/DDM rounding (N4), error labels (N5), `Select.NULL` handling (N6), and the minor issues in N7.
 * Add a shared `parse_gps_time()` helper (F11).
 * Track the TPV receipt time separately from `last_seen` and use it for fix age and PPS sync (F2).
 * Feed position hold and the logger only on **new TPV** epochs (F1). Track an altitude-only count (F12).
