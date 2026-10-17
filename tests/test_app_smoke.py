@@ -1081,3 +1081,23 @@ async def test_units_key_updates_every_panel(make_gps_data):
         app._hold.add_fix(47.00001, -122.0, 11.0)
         await pilot.press("h")
     assert notes[-1].startswith("Hold stopped: 2 fixes, CEP50=") and notes[-1].endswith(" ft")
+
+
+async def test_timing_tab_labels_toff_source_end_to_end():
+    from tests.test_gpsd_client import TOFF_325, tpv
+
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        client = GPSDClient()
+        client._on_update = app._on_gpsd_update
+        app.query_one(TabbedContent).active = "tab-timing"
+        await pilot.pause()
+        for t in ("2026-03-14T12:00:00Z", "2026-03-14T12:00:01Z"):
+            await asyncio.to_thread(client._handle_line, tpv(time=t))
+        await settle(pilot, app)
+        plain = app.query_one("#w-time-detail").render().plain
+        assert "(computed)" in plain
+        assert "Computed TOFF stats (TPV vs system clock)" in plain
+        await asyncio.to_thread(client._handle_line, TOFF_325)
+        await settle(pilot, app)
+        assert "(gpsd TOFF)" in app.query_one("#w-time-detail").render().plain

@@ -260,6 +260,7 @@ async def test_time_panel_armed_and_single_sample(make_gps_data):
         assert "+4.200 ms" in plain
         assert "2026-03-14T12:00:00.500Z" in plain
         assert "1 sample" in plain
+        assert "Computed TOFF stats (TPV vs system clock)" in plain
 
 
 def test_time_panel_fmt_offset():
@@ -676,3 +677,32 @@ async def test_error_panel_hides_missing_optional_estimates():
         plain = err.render().plain
         assert "EPH: ---" in plain and "EPC: ---" in plain
         assert "EPX" not in plain and "SEP" not in plain
+
+
+# ─── TOFF source labels ─────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("source, label", [("gpsd", "(gpsd TOFF)"), ("computed", "(computed)")])
+async def test_time_panel_labels_toff_source(source, label, make_gps_data):
+    tp = TimePanel(show_pps=True)
+    app = Harness(tp)
+    async with app.run_test(size=(100, 60)):
+        tp.update_gps_data(make_gps_data(toff_source=source))
+        plain = tp.render().plain
+        assert f"Offset:  -12.000 ms  {label}" in plain
+        stats = plain.split("Computed TOFF stats (TPV vs system clock)\n")[1]
+        assert stats.startswith("  (4 samples)")
+        assert "Mean:" in stats
+
+
+async def test_time_panel_toff_without_source_or_stats():
+    tp = TimePanel(show_pps=True)
+    app = Harness(tp)
+    async with app.run_test(size=(100, 60)):
+        from tuigps.data_model import TOFFData
+
+        tp.update_gps_data(GPSData(toff=TOFFData(real_sec=10.0, real_nsec=0.0, clock_sec=10.0,
+                                                 clock_nsec=1000.0)))
+        plain = tp.render().plain
+        assert "Offset:  -1.000 us\n" in plain  # no source label
+        assert "Computed TOFF stats" not in plain

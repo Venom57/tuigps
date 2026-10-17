@@ -149,10 +149,14 @@ class GPSData:
     errors: ErrorEstimates = field(default_factory=ErrorEstimates)
     pps: PPSData = field(default_factory=PPSData)
     toff: TOFFData = field(default_factory=TOFFData)
+    # Where ``toff`` came from: "gpsd" (a gpsd TOFF report, PPS-capable
+    # devices) or "computed" (TPV time vs. system clock at receipt); "" = none
+    toff_source: str = ""
     device: DeviceInfo = field(default_factory=DeviceInfo)
     version: VersionInfo = field(default_factory=VersionInfo)
 
-    # TOFF history (last N offset samples in seconds, computed on gpsd thread)
+    # TOFF history (last N offset samples in seconds): always computed on the
+    # gpsd thread from TPV time vs. system clock, whatever ``toff_source`` is
     toff_samples: list[float] = field(default_factory=list)
 
     # Armed TOFF result: single-shot measurement (offset in seconds, or NaN)

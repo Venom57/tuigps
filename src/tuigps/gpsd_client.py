@@ -536,6 +536,7 @@ class GPSDClient:
                 clock_sec=float(sys_sec),
                 clock_nsec=(sys_epoch - sys_sec) * 1e9,
             )
+            d.toff_source = "computed"
 
         # Accumulate TOFF sample (offset in seconds)
         offset = gps_epoch - sys_epoch
@@ -608,6 +609,7 @@ class GPSDClient:
             clock_sec=_safe_float(m.get("clock_sec")),
             clock_nsec=_safe_float(m.get("clock_nsec")),
         )
+        d.toff_source = "gpsd"
 
     @staticmethod
     def _device_info(dev: dict) -> DeviceInfo:

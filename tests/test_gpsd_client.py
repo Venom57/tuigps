@@ -309,6 +309,7 @@ def test_tpv_computes_toff_from_receipt_time(client):
     assert t.clock_sec == float(int(GPS_EPOCH))
     assert t.clock_nsec == pytest.approx(262e6, abs=1e3)
     assert client.data.toff_samples == [pytest.approx(-0.012, abs=1e-6)]
+    assert client.data.toff_source == "computed"
 
 
 def test_tpv_toff_time_without_fraction(client):
@@ -322,6 +323,7 @@ def test_tpv_toff_needs_parseable_time(client, time_value):
     feed(client, tpv(time=time_value), received=GPS_EPOCH)
     assert math.isnan(client.data.toff.real_sec)
     assert client.data.toff_samples == []
+    assert client.data.toff_source == ""
 
 
 def test_tpv_toff_buffer_is_bounded(client):
@@ -362,12 +364,17 @@ def test_toff_armed_single_shot(client):
 def test_gpsd_toff_message_takes_precedence(client):
     """N7: a recent gpsd TOFF message is not overwritten by the TPV-computed TOFF."""
     feed(client, TOFF_325, received=GPS_EPOCH)
+    assert client.data.toff_source == "gpsd"
     feed(client, TPV_325, received=GPS_EPOCH + 4.9)
     assert client.data.toff.real_sec == 10.0 and client.data.toff.clock_nsec == 30.0
+    assert client.data.toff_source == "gpsd"
     assert len(client.data.toff_samples) == 1  # TPV-derived samples still accumulate
     # Once the gpsd TOFF is older than GPSD_TOFF_HOLD the computed value is used
     feed(client, TPV_325, received=GPS_EPOCH + 5.1)
     assert client.data.toff.real_sec == float(int(GPS_EPOCH))
+    assert client.data.toff_source == "computed"
+    client.reset()
+    assert client.data.toff_source == ""
 
 
 # ─── SKY ────────────────────────────────────────────────────────────────

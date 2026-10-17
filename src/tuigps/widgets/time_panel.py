@@ -11,6 +11,10 @@ from ..data_model import GPSData
 from ..formatting import fmt, fmt_time_iso
 
 
+# Labels for GPSData.toff_source
+TOFF_SOURCES = {"gpsd": "gpsd TOFF", "computed": "computed"}
+
+
 class TimePanel(Static):
     """Displays GPS time, PPS, and TOFF information."""
 
@@ -135,7 +139,11 @@ class TimePanel(Static):
             toff_offset = (toff.real_sec - toff.clock_sec) + (toff.real_nsec - toff.clock_nsec) / 1e9
             if math.isfinite(toff_offset):
                 txt.append("  Offset:  ", style="bright_black")
-                txt.append(self._fmt_offset(toff_offset) + "\n")
+                txt.append(self._fmt_offset(toff_offset))
+                source = TOFF_SOURCES.get(d.toff_source, "")
+                if source:
+                    txt.append(f"  ({source})", style="dim")
+                txt.append("\n")
         else:
             txt.append("  No TOFF data\n", style="dim")
 
@@ -163,7 +171,9 @@ class TimePanel(Static):
             min_s = min(samples)
             max_s = max(samples)
 
-            txt.append(f"\n  ({len(samples)} samples)\n", style="dim")
+            txt.append("\n")
+            txt.append("Computed TOFF stats (TPV vs system clock)\n", style="bold")
+            txt.append(f"  ({len(samples)} samples)\n", style="dim")
             txt.append("  Mean:    ", style="bright_black")
             txt.append(self._fmt_offset(mean_s) + "\n")
             txt.append("  Std:     ", style="bright_black")
@@ -173,6 +183,8 @@ class TimePanel(Static):
             txt.append("  Max:     ", style="bright_black")
             txt.append(self._fmt_offset(max_s) + "\n")
         elif len(samples) == 1:
+            txt.append("\n")
+            txt.append("Computed TOFF stats (TPV vs system clock)\n", style="bold")
             txt.append("  (1 sample — need more for stats)\n", style="dim")
 
         # ── DOP timing ──
