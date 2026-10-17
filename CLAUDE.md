@@ -4,14 +4,14 @@ Terminal UI GPS monitoring tool using gpsd.
 
 ## Tech Stack
 - **Python 3.10+** with **Textual** (TUI framework) and **Rich** (text rendering)
-- **python3-gps** system package (apt) for gpsd connection — not pip-installable
-- Threaded gpsd client (`gpsd_client.py`) communicates with Textual via `App.call_from_thread()`
+- Native gpsd JSON protocol client (`gpsd_client.py`, stdlib sockets only — no python3-gps dependency)
+- Threaded gpsd client communicates with Textual via `App.call_from_thread()`
 
 ## Project Structure
 - `src/tuigps/` — main package
   - `app.py` — Textual App entry point
   - `app.tcss` — CSS layout
-  - `gpsd_client.py` — threaded gpsd connection
+  - `gpsd_client.py` — threaded native gpsd client (TCP, `?WATCH`, JSON + raw NMEA)
   - `data_model.py` — dataclasses for GPS state
   - `constants.py` — GNSS names, colors, status maps
   - `formatting.py` — NaN-safe formatting helpers
@@ -23,7 +23,8 @@ Terminal UI GPS monitoring tool using gpsd.
 - Widgets implement `update_gps_data(data: GPSData)` and override `render() -> Text`
 - NaN values are used for unavailable data; always check `math.isfinite()` before display
 - The gpsd client runs in a daemon thread with auto-reconnect (2s delay)
-- `sys.path` manipulation may be needed to access system `python3-gps` from a venv
+- The client mutates a private working `GPSData` and publishes shallow-copy snapshots to `on_update`; it always replaces nested objects/lists, never mutates them in place, so snapshots never change after publication
+- Tests never touch a real gpsd: the default port is patched to a refusing port, and `tests/fake_gpsd.py` provides a scriptable fake gpsd TCP server
 
 ## Commands
 - `pip install -e .` — install in dev mode

@@ -1,199 +1,52 @@
 """Shared test fixtures.
 
-The system ``python3-gps`` package is not pip-installable and is usually not
-present in a dev venv, but ``tuigps.gpsd_client`` does ``import gps`` at import
-time. We install a small fake ``gps`` module into ``sys.modules`` *before* any
-``tuigps`` module is imported so the whole package (and the app) imports
-cleanly. The fake module's ``gps`` constructor refuses to connect by default;
-tests can install a session factory via the ``fake_gps`` fixture.
+No test may talk to a real gpsd: the client's default port is pointed at a
+local port that refuses connections (a bound, non-listening socket), and
+end-to-end tests use the scriptable fake gpsd server in ``fake_gpsd.py``.
 """
 
 from __future__ import annotations
 
+import socket
 import subprocess
-import sys
 import time
-import types
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 import pytest
+
+from tests.fake_gpsd import FakeGpsd
 
 NAN = float("nan")
 
 
-# ─── Fake python-gps session ────────────────────────────────────────────
+# ─── gpsd endpoints ─────────────────────────────────────────────────────
 
 
-def make_fix(**overrides: Any) -> types.SimpleNamespace:
-    """Build an object mimicking ``gps.gpsfix`` (NaN for unknown values)."""
-    fields: dict[str, Any] = {
-        "latitude": NAN,
-        "longitude": NAN,
-        "altHAE": NAN,
-        "altMSL": NAN,
-        "geoidSep": NAN,
-        "speed": NAN,
-        "track": NAN,
-        "climb": NAN,
-        "mode": 0,
-        "status": 0,
-        "time": NAN,  # python-gps uses NaN until a time string is received
-        "magtrack": NAN,
-        "magvar": NAN,
-        "eph": NAN,
-        "epv": NAN,
-        "ept": NAN,
-        "eps": NAN,
-        "epd": NAN,
-        "epc": NAN,
-        "epx": NAN,
-        "epy": NAN,
-        "sep": NAN,
-        "ecefx": NAN,
-        "ecefy": NAN,
-        "ecefz": NAN,
-        "ecefvx": NAN,
-        "ecefvy": NAN,
-        "ecefvz": NAN,
-    }
-    fields.update(overrides)
-    return types.SimpleNamespace(**fields)
-
-
-class FakeGpsSession:
-    """Mimics the attributes of a python-gps ``gps.gps`` session object.
-
-    ``messages`` is a list of dicts. Each ``read()`` pops one dict and applies
-    it to the session: the ``"fix"`` key (a dict) updates ``self.fix``, every
-    other key sets the attribute of the same name (``data``, ``response``,
-    ``utc``, ``hdop`` ...). When the script is exhausted ``read()`` returns -1
-    (gpsd disconnected), like the real library.
-
-    ``waiting_script`` optionally provides the sequence of ``waiting()``
-    results; once exhausted ``waiting()`` returns True.
-    """
-
-    def __init__(
-        self,
-        messages: list[dict[str, Any]] | None = None,
-        waiting_script: list[bool] | None = None,
-        **attrs: Any,
-    ) -> None:
-        self.fix = make_fix()
-        self.data: dict[str, Any] = {}
-        self.utc = ""
-        self.response = ""
-        # DOPs (set by SKY)
-        self.hdop = NAN
-        self.vdop = NAN
-        self.pdop = NAN
-        self.gdop = NAN
-        self.tdop = NAN
-        self.xdop = NAN
-        self.ydop = NAN
-        # PPS
-        self.real_sec = NAN
-        self.real_nsec = NAN
-        self.clock_sec = NAN
-        self.clock_nsec = NAN
-        self.precision = 0
-        # DEVICE
-        self.path = ""
-        self.gps_id = ""
-        self.baudrate = 0
-        self.cycle = NAN
-        self.mincycle = NAN
-        # VERSION
-        self.version = None
-
-        self.closed = False
-        self.read_count = 0
-        self._messages = list(messages or [])
-        self._waiting = list(waiting_script or [])
-        self.apply(attrs)
-
-    def apply(self, msg: dict[str, Any]) -> None:
-        for key, value in msg.items():
-            if key == "fix":
-                for fk, fv in value.items():
-                    setattr(self.fix, fk, fv)
-            else:
-                setattr(self, key, value)
-
-    def waiting(self, timeout: float = 0) -> bool:
-        if self._waiting:
-            return self._waiting.pop(0)
-        return True
-
-    def read(self) -> int:
-        self.read_count += 1
-        if not self._messages:
-            return -1
-        self.apply(self._messages.pop(0))
-        return 0
-
-    def close(self) -> None:
-        self.closed = True
-
-
-# ─── Fake ``gps`` module ────────────────────────────────────────────────
-
-
-class _FakeGpsConstructor:
-    """Stand-in for ``gps.gps``.
-
-    Calling it records the arguments and delegates to ``factory``. When no
-    factory is installed it raises ``ConnectionRefusedError`` like the real
-    library does when gpsd is not running.
-    """
-
-    factory: Callable[..., Any] | None = None
-    calls: list[dict[str, Any]] = []
-
-    def __new__(cls, host: str = "127.0.0.1", port: str = "2947", mode: int = 0, **kwargs: Any):
-        cls.calls.append({"host": host, "port": port, "mode": mode, **kwargs})
-        if cls.factory is None:
-            raise ConnectionRefusedError(111, "Connection refused (fake gps)")
-        return cls.factory(host=host, port=port, mode=mode, **kwargs)
-
-
-def _build_fake_gps_module() -> types.ModuleType:
-    mod = types.ModuleType("gps")
-    mod.__doc__ = "Fake python3-gps module for tests"
-    # Values match gps/watch_options.py in gpsd.
-    mod.WATCH_ENABLE = 0x000001
-    mod.WATCH_DISABLE = 0x000002
-    mod.WATCH_JSON = 0x000010
-    mod.WATCH_NMEA = 0x000020
-    mod.WATCH_RARE = 0x000040
-    mod.WATCH_RAW = 0x000080
-    mod.WATCH_SCALED = 0x000100
-    mod.WATCH_TIMING = 0x000200
-    mod.WATCH_DEVICE = 0x000800
-    mod.WATCH_PPS = 0x002000
-    mod.gps = _FakeGpsConstructor
-    mod.FakeGpsSession = FakeGpsSession
-    mod.__fake__ = True
-    return mod
-
-
-FAKE_GPS_MODULE = _build_fake_gps_module()
-# Always override, even if a real python3-gps happens to be importable.
-sys.modules["gps"] = FAKE_GPS_MODULE
-
-
-# ─── Fixtures ───────────────────────────────────────────────────────────
+@pytest.fixture(scope="session")
+def refused_port():
+    """A local TCP port that refuses connections for the whole session."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))  # bound but never listening -> ECONNREFUSED
+    yield sock.getsockname()[1]
+    sock.close()
 
 
 @pytest.fixture(autouse=True)
-def _reset_fake_gps():
-    """Reset the fake gps constructor state between tests."""
-    _FakeGpsConstructor.factory = None
-    _FakeGpsConstructor.calls = []
-    yield
-    _FakeGpsConstructor.factory = None
-    _FakeGpsConstructor.calls = []
+def _no_real_gpsd(monkeypatch, refused_port):
+    """Never connect to a real gpsd on 127.0.0.1:2947 from tests."""
+    from tuigps import gpsd_client
+
+    monkeypatch.setattr(gpsd_client, "DEFAULT_HOST", "127.0.0.1")
+    monkeypatch.setattr(gpsd_client, "DEFAULT_PORT", str(refused_port))
+
+
+@pytest.fixture
+def fake_gpsd():
+    """A running fake gpsd server (see tests/fake_gpsd.py)."""
+    server = FakeGpsd()
+    yield server
+    server.close()
 
 
 @pytest.fixture(autouse=True)
@@ -204,63 +57,6 @@ def _no_real_subprocess(monkeypatch):
         raise AssertionError(f"unexpected subprocess.run in tests: {cmd!r}")
 
     monkeypatch.setattr(subprocess, "run", _refuse)
-
-
-@pytest.fixture
-def fake_gps():
-    """The fake ``gps`` module. Set ``fake_gps.gps.factory`` to allow connects."""
-    return FAKE_GPS_MODULE
-
-
-@pytest.fixture
-def fake_session() -> Callable[..., FakeGpsSession]:
-    """Factory for FakeGpsSession objects."""
-    return FakeGpsSession
-
-
-@pytest.fixture
-def tpv_session() -> Callable[..., FakeGpsSession]:
-    """Factory for a session positioned on a full 3D-fix TPV message."""
-
-    def _make(**fix_overrides: Any) -> FakeGpsSession:
-        fix = dict(
-            latitude=47.6062,
-            longitude=-122.3321,
-            altHAE=30.5,
-            altMSL=50.25,
-            geoidSep=-19.75,
-            speed=1.5,
-            track=271.0,
-            climb=0.25,
-            mode=3,
-            status=2,
-            time="2026-03-14T12:00:00.250Z",
-            magtrack=255.0,
-            magvar=15.3,
-            eph=3.1,
-            epv=4.2,
-            ept=0.005,
-            eps=0.6,
-            epd=12.0,
-            epc=0.8,
-            epx=2.1,
-            epy=2.2,
-            sep=5.3,
-            ecefx=-2304000.1,
-            ecefy=-3638000.2,
-            ecefz=4688000.3,
-            ecefvx=0.1,
-            ecefvy=0.2,
-            ecefvz=0.3,
-        )
-        fix.update(fix_overrides)
-        return FakeGpsSession(
-            fix=fix,
-            data={"class": "TPV", "leapseconds": 18},
-            utc="2026-03-14T12:00:00.250Z",
-        )
-
-    return _make
 
 
 def sample_satellites():

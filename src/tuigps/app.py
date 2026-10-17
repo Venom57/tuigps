@@ -258,11 +258,9 @@ class TuiGPS(App):
 
     def _arm_toff(self) -> None:
         """Arm single-shot TOFF: fires on next TPV message with GPS time."""
-        # Clear previous armed result
-        self._gps_data.toff_armed_offset = float("nan")
-        self._gps_data.toff_armed_gps_time = ""
-        self._gps_data.toff_armed_sys_time = 0.0
-        self._gpsd.toff_armed = True
+        # Clear the previous armed result (in the client, then refresh the view)
+        self._gpsd.arm_toff()
+        self._gps_data = self._gpsd.data
         with self._ui_guard("#btn-arm-toff"):
             btn = self.query_one("#btn-arm-toff", Button)
             btn.variant = "success"
@@ -271,12 +269,8 @@ class TuiGPS(App):
 
     def _clear_toff(self) -> None:
         """Clear TOFF history and armed result."""
-        self._gpsd._toff_buffer.clear()
-        self._gpsd.toff_armed = False
-        self._gps_data.toff_samples = []
-        self._gps_data.toff_armed_offset = float("nan")
-        self._gps_data.toff_armed_gps_time = ""
-        self._gps_data.toff_armed_sys_time = 0.0
+        self._gpsd.clear_toff()
+        self._gps_data = self._gpsd.data
         with self._ui_guard("#btn-arm-toff"):
             btn = self.query_one("#btn-arm-toff", Button)
             btn.variant = "warning"

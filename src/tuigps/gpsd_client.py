@@ -1,10 +1,28 @@
-"""Threaded gpsd client that reads GPS data and populates GPSData."""
+"""Native gpsd client: reads the gpsd JSON protocol in a background thread.
+
+The client speaks the gpsd protocol directly over TCP (stdlib only): it sends
+one ``?WATCH`` command after connecting and then reads newline-terminated
+lines. JSON objects (``{...}``) are decoded into a private working
+:class:`GPSData`; raw NMEA/AIS lines (``$...`` / ``!...``, enabled by
+``"nmea":true``) are passed through to ``on_nmea``.
+
+Every processed JSON message publishes a snapshot to ``on_update``: a shallow
+copy of the working data. The client never mutates a nested object (DOP,
+errors, PPS, TOFF, device, version) or a list (satellites, toff_samples) in
+place - it always assigns a new one - so a published snapshot never changes
+after it has been handed out.
+"""
 
 from __future__ import annotations
 
+import copy
+import errno
+import json
 import logging
 import math
-import sys
+import os
+import select
+import socket
 import threading
 import time
 from collections import deque
@@ -21,57 +39,131 @@ from .data_model import (
 )
 from .timeutil import parse_gps_time
 
-# The python3-gps package is a system apt package, not on PyPI.
-# When running in a venv it may not be on sys.path.
-# We append (not insert) to avoid overriding venv packages like typing_extensions,
-# and remove the path after import to prevent pollution.
-try:
-    import gps as _gps_module
-except ImportError:
-    _sys_path = "/usr/lib/python3/dist-packages"
-    sys.path.append(_sys_path)
-    try:
-        import gps as _gps_module
-    finally:
-        try:
-            sys.path.remove(_sys_path)
-        except ValueError:
-            pass
-
 log = logging.getLogger(__name__)
+
+NAN = float("nan")
+
+DEFAULT_HOST = "127.0.0.1"
+DEFAULT_PORT = "2947"
+
+# The ?WATCH parameters, in the order python-gps (gps.client) emits them for
+# WATCH_ENABLE | WATCH_JSON | WATCH_NMEA | WATCH_TIMING | WATCH_PPS.
+WATCH_PARAMS: dict[str, bool] = {
+    "enable": True,
+    "json": True,
+    "nmea": True,
+    "timing": True,
+    "pps": True,
+}
+WATCH_COMMAND = "?WATCH=" + json.dumps(WATCH_PARAMS, separators=(",", ":")) + "\n"
+
+_IN_PROGRESS = {errno.EINPROGRESS, errno.EWOULDBLOCK, errno.EALREADY}
+_IN_PROGRESS.add(getattr(errno, "WSAEWOULDBLOCK", errno.EWOULDBLOCK))
+
+
+class _Stopped(Exception):
+    """Raised inside the client thread when stop() interrupts a connect."""
+
+
+def format_server(host: str, port) -> str:
+    """``host:port``, with brackets around IPv6 literals."""
+    return f"[{host}]:{port}" if ":" in str(host) else f"{host}:{port}"
+
+
+def _safe_float(value) -> float:
+    """Convert a value to float, returning NaN for missing/invalid values."""
+    if isinstance(value, bool):
+        return NAN
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return NAN
+
+
+def _safe_int(value, default: int = 0) -> int:
+    """Convert a value to int, returning ``default`` for missing/invalid values."""
+    if value is None or isinstance(value, bool):
+        return default
+    try:
+        f = float(value)
+        if not math.isfinite(f):
+            return default
+        return int(f)
+    except (TypeError, ValueError, OverflowError):
+        return default
+
+
+def _safe_str(value) -> str:
+    return "" if value is None else str(value)
+
+
+class LineBuffer:
+    """Reassembles newline-terminated lines from arbitrary recv() chunks."""
+
+    MAX_LINE = 64 * 1024  # a partial line longer than this is discarded
+
+    def __init__(self) -> None:
+        self._buf = bytearray()
+
+    def feed(self, chunk: bytes) -> list[str]:
+        """Add a chunk; return the complete, decoded, non-blank lines it finished."""
+        self._buf += chunk
+        lines: list[str] = []
+        while True:
+            nl = self._buf.find(b"\n")
+            if nl < 0:
+                break
+            raw = bytes(self._buf[:nl])
+            del self._buf[: nl + 1]
+            line = raw.decode("utf-8", errors="replace").strip("\r").strip()
+            if line:
+                lines.append(line)
+        if len(self._buf) > self.MAX_LINE:
+            log.warning("discarding %d bytes of gpsd input without a newline", len(self._buf))
+            self._buf.clear()
+        return lines
+
+    def clear(self) -> None:
+        self._buf.clear()
 
 
 class GPSDClient:
     """Connects to gpsd in a background thread and keeps GPSData updated."""
 
     RECONNECT_DELAY = 2.0  # seconds between connection attempts
-    POLL_TIMEOUT = 0.5  # max wait per waiting() call; bounds stop() latency
+    CONNECT_TIMEOUT = 5.0  # TCP connect timeout per address
+    POLL_TIMEOUT = 0.5  # max wait per recv()/select(); bounds stop() latency
     STOP_TIMEOUT = 1.0  # max time stop() waits for the thread to exit
+    RECV_SIZE = 65536
     GPSD_TOFF_HOLD = 5.0  # prefer a gpsd TOFF message this recent over computed TOFF
 
-    def __init__(self, host: str = "127.0.0.1", port: str = "2947"):
-        self.host = host
-        self.port = port
-        self._session: _gps_module.gps | None = None
+    def __init__(self, host: str | None = None, port: str | int | None = None):
+        self.host = DEFAULT_HOST if host is None else str(host)
+        self.port = DEFAULT_PORT if port is None else str(port)
+        self._sock: socket.socket | None = None
         self._thread: threading.Thread | None = None
         # Each run gets its own stop event, so a stopped thread can never be
         # revived by a later start() (see _running).
         self._stop_event = threading.Event()
         self._stop_event.set()
-        self._data = GPSData()
+        self._data = GPSData()  # private working copy, guarded by _lock
         self._lock = threading.Lock()
         self._on_update: callable = None
         self._on_error: callable = None
         self._on_nmea: callable = None
         self._toff_buffer: deque[float] = deque(maxlen=20)
-        self._receipt_time: float = 0.0  # time.time() at message receipt
         self._gpsd_toff_received: float = 0.0  # receipt time of last gpsd TOFF
         self.toff_armed = False  # armed: fire on next TPV with GPS time
 
     @property
+    def server(self) -> str:
+        return format_server(self.host, self.port)
+
+    @property
     def data(self) -> GPSData:
+        """A snapshot of the current data (safe to read from any thread)."""
         with self._lock:
-            return self._data
+            return copy.copy(self._data)
 
     @property
     def _running(self) -> bool:
@@ -85,8 +177,10 @@ class GPSDClient:
         elif self._stop_event.is_set():
             self._stop_event = threading.Event()
 
+    # ─── Lifecycle ───────────────────────────────────────────────────
+
     def start(self, on_update: callable = None, on_error: callable = None, on_nmea: callable = None) -> None:
-        """Start the gpsd polling thread (stopping any previous one first)."""
+        """Start the gpsd reader thread (stopping any previous one first)."""
         self.stop()
         self._on_update = on_update
         self._on_error = on_error
@@ -98,10 +192,10 @@ class GPSDClient:
         self._thread.start()
 
     def stop(self, timeout: float | None = None) -> None:
-        """Stop the polling thread and wait (bounded) for it to exit."""
+        """Stop the reader thread and wait (bounded) for it to exit."""
         self._stop_event.set()
-        session, self._session = self._session, None
-        self._close_session(session)
+        sock, self._sock = self._sock, None
+        self._close_socket(sock)
         thread = self._thread
         if thread is not None and thread is not threading.current_thread() and thread.is_alive():
             thread.join(self.STOP_TIMEOUT if timeout is None else timeout)
@@ -112,86 +206,216 @@ class GPSDClient:
         """Discard all received data, e.g. before reconnecting."""
         with self._lock:
             self._data = GPSData()
-        self._toff_buffer.clear()
-        self._gpsd_toff_received = 0.0
+            self._toff_buffer.clear()
+            self._gpsd_toff_received = 0.0
+
+    def arm_toff(self) -> None:
+        """Arm a single-shot TOFF measurement on the next TPV with a GPS time."""
+        with self._lock:
+            d = self._data
+            d.toff_armed_offset = NAN
+            d.toff_armed_gps_time = ""
+            d.toff_armed_sys_time = 0.0
+            self.toff_armed = True
+
+    def clear_toff(self) -> None:
+        """Clear the TOFF history and any armed result."""
+        with self._lock:
+            self.toff_armed = False
+            self._toff_buffer.clear()
+            d = self._data
+            d.toff_samples = []
+            d.toff_armed_offset = NAN
+            d.toff_armed_gps_time = ""
+            d.toff_armed_sys_time = 0.0
+
+    # ─── Thread main loop ────────────────────────────────────────────
 
     def _run(self, stop: threading.Event | None = None) -> None:
-        """Main polling loop — runs in background thread."""
+        """Connect / read / reconnect loop - runs in the background thread."""
         if stop is None:
             stop = self._stop_event
         while not stop.is_set():
-            session = None
+            sock = None
             try:
-                session = self._connect()
-                self._poll_loop(session, stop)
+                sock = self._open_socket(stop)
+                self._sock = sock
+                if stop.is_set():
+                    break
+                sock.sendall(WATCH_COMMAND.encode("ascii"))
+                self._on_connected()
+                self._read_loop(sock, stop)
+            except _Stopped:
+                break
             except Exception as exc:
                 if stop.is_set():
-                    break  # errors caused by stop() closing the session
-                with self._lock:
-                    self._data.connected = False
-                    self._data.error_message = str(exc)
-                self._call(self._on_error, str(exc))
+                    break  # errors caused by stop() closing the socket
+                self._on_connection_lost(self._describe_error(exc))
             finally:
-                # Close session before retrying
-                if session is not None and self._session is session:
-                    self._session = None
-                self._close_session(session)
+                if sock is not None and self._sock is sock:
+                    self._sock = None
+                self._close_socket(sock)
 
             # Wait before reconnecting (returns at once when stopped)
             stop.wait(self.RECONNECT_DELAY)
 
-    @staticmethod
-    def _close_session(session) -> None:
-        if session is None:
-            return
-        try:
-            session.close()
-        except OSError as exc:
-            log.debug("closing gpsd session failed: %s", exc)
-
-    def _connect(self):
-        """Establish connection to gpsd. Returns the new session."""
-        watch_flags = (
-            _gps_module.WATCH_ENABLE
-            | _gps_module.WATCH_JSON
-            | _gps_module.WATCH_PPS
-            | _gps_module.WATCH_TIMING
-            | _gps_module.WATCH_NMEA
-        )
-        session = _gps_module.gps(
-            host=self.host,
-            port=self.port,
-            mode=watch_flags,
-        )
-        self._session = session
+    def _on_connected(self) -> None:
         with self._lock:
             self._data.connected = True
             self._data.error_message = ""
-        self._notify_update()
-        return session
+        self._publish()
 
-    def _poll_loop(self, session, stop: threading.Event) -> None:
-        """Read reports until disconnected or stopped."""
+    def _on_connection_lost(self, message: str) -> None:
+        with self._lock:
+            self._data.connected = False
+            self._data.error_message = message
+        self._publish()
+        self._call(self._on_error, message)
+
+    def _describe_error(self, exc: BaseException) -> str:
+        if isinstance(exc, ConnectionError) and str(exc) == "gpsd disconnected":
+            return "gpsd disconnected"
+        if isinstance(exc, socket.gaierror):
+            return f"cannot resolve {self.host}: {exc.strerror or exc}"
+        if isinstance(exc, OSError) and exc.strerror:
+            return f"{exc.strerror} ({self.server})"
+        return f"{exc or type(exc).__name__} ({self.server})"
+
+    def _open_socket(self, stop: threading.Event) -> socket.socket:
+        """Connect to gpsd (IPv4/IPv6/hostname), honouring stop and a timeout."""
+        infos = socket.getaddrinfo(self.host, self.port, 0, socket.SOCK_STREAM)
+        last_exc: Exception = OSError(f"no address for {self.host}")
+        for family, socktype, proto, _canon, addr in infos:
+            sock = socket.socket(family, socktype, proto)
+            try:
+                sock.setblocking(False)
+                err = sock.connect_ex(addr)
+                if err and err not in _IN_PROGRESS:
+                    raise OSError(err, os.strerror(err))
+                deadline = time.monotonic() + self.CONNECT_TIMEOUT
+                while err:
+                    if stop.is_set():
+                        raise _Stopped()
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError(errno.ETIMEDOUT, "Connection timed out")
+                    _r, w, x = select.select([], [sock], [sock], min(self.POLL_TIMEOUT, remaining))
+                    if w or x:
+                        err = sock.getsockopt(socket.SOL_SOCKET, socket.SO_ERROR)
+                        if err:
+                            raise OSError(err, os.strerror(err))
+                        break
+                sock.settimeout(self.POLL_TIMEOUT)
+                return sock
+            except _Stopped:
+                sock.close()
+                raise
+            except OSError as exc:
+                sock.close()
+                last_exc = exc
+        raise last_exc
+
+    @staticmethod
+    def _close_socket(sock: socket.socket | None) -> None:
+        if sock is None:
+            return
+        try:
+            sock.shutdown(socket.SHUT_RDWR)  # wakes a recv() blocked in another thread
+        except OSError:
+            pass
+        try:
+            sock.close()
+        except OSError as exc:
+            log.debug("closing gpsd socket failed: %s", exc)
+
+    def _read_loop(self, sock: socket.socket, stop: threading.Event) -> None:
+        """Read and process lines until disconnected or stopped."""
+        buffer = LineBuffer()
         while not stop.is_set():
-            if not session.waiting(timeout=self.POLL_TIMEOUT):
+            try:
+                chunk = sock.recv(self.RECV_SIZE)
+            except (socket.timeout, TimeoutError):
                 continue
-            result = session.read()
-            self._receipt_time = time.time()  # capture ASAP for precise TOFF
-            if result == -1:
+            received = time.time()  # capture ASAP: receipt time for TOFF / fix age
+            if not chunk:
                 raise ConnectionError("gpsd disconnected")
             if stop.is_set():
                 break
+            for line in buffer.feed(chunk):
+                if stop.is_set():
+                    return
+                self._handle_line(line, received)
 
-            # Capture raw NMEA sentences before extracting structured data
-            response = getattr(session, "response", "")
-            if response and response.startswith("$"):
-                self._call(self._on_nmea, response.rstrip())
+    # ─── Message processing ──────────────────────────────────────────
 
-            self._extract_data(session)
-            self._notify_update()
+    def _handle_line(self, line: str, received: float | None = None) -> None:
+        """Process one protocol line (JSON report or raw NMEA/AIS sentence)."""
+        if received is None:
+            received = time.time()
+        if line[:1] in ("$", "!"):
+            with self._lock:
+                self._data.last_seen = received
+            self._call(self._on_nmea, line.rstrip())
+            return
+        if line[:1] != "{":
+            log.debug("ignoring non-JSON gpsd line: %.80r", line)
+            return
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            log.debug("ignoring malformed gpsd JSON: %.80r", line)
+            return
+        if not isinstance(msg, dict):
+            log.debug("ignoring non-object gpsd JSON: %.80r", line)
+            return
+        try:
+            error = self._process_message(msg, received)
+        except Exception:
+            log.exception("failed to process gpsd %s message", msg.get("class"))
+            return
+        self._publish()
+        if error:
+            self._call(self._on_error, error)
 
-    def _notify_update(self) -> None:
-        self._call(self._on_update, self._data)
+    def _process_message(self, msg: dict, received: float) -> str | None:
+        """Apply one decoded JSON report to the working data.
+
+        Returns an error message to surface (gpsd ERROR reports), else None.
+        """
+        cls = msg.get("class", "")
+        with self._lock:
+            d = self._data
+            d.connected = True
+            d.last_seen = received
+            d.error_message = ""
+            if cls == "TPV":
+                self._apply_tpv(msg, d, received)
+            elif cls == "SKY":
+                self._apply_sky(msg, d)
+            elif cls == "PPS":
+                self._apply_pps(msg, d)
+            elif cls == "TOFF":
+                self._apply_toff(msg, d, received)
+            elif cls == "DEVICE":
+                self._apply_device(msg, d)
+            elif cls == "DEVICES":
+                self._apply_devices(msg, d)
+            elif cls == "VERSION":
+                self._apply_version(msg, d)
+            elif cls == "ERROR":
+                message = _safe_str(msg.get("message")) or "unknown error"
+                log.warning("gpsd error: %s", message)
+                return f"gpsd error: {message}"
+            # WATCH, GST, ATT, IMU, POLL, RAW, AIS, ...: not displayed
+        return None
+
+    def _publish(self) -> None:
+        """Hand a snapshot of the working data to on_update."""
+        if self._on_update is None:
+            return
+        with self._lock:
+            snapshot = copy.copy(self._data)
+        self._call(self._on_update, snapshot)
 
     @staticmethod
     def _call(callback, *args) -> None:
@@ -203,228 +427,201 @@ class GPSDClient:
         except Exception:
             log.exception("gpsd client callback %r failed", callback)
 
-    def _safe_float(self, value) -> float:
-        """Convert a value to float, returning NaN for invalid values."""
-        try:
-            f = float(value)
-            return f
-        except (TypeError, ValueError):
-            return float("nan")
+    # Every _apply_* method assigns new nested objects/lists rather than
+    # mutating existing ones, so published snapshots stay unchanged.
 
-    def _extract_data(self, session=None) -> None:
-        """Extract data from the gps session into our data model."""
-        s = session if session is not None else self._session
-        if s is None:
-            return
-
-        with self._lock:
-            d = self._data
-            d.connected = True
-            d.last_seen = time.time()
-            d.error_message = ""
-
-            msg_class = s.data.get("class", "") if hasattr(s, "data") and hasattr(s.data, "get") else ""
-
-            if msg_class == "TPV":
-                self._extract_tpv(s, d)
-            elif msg_class == "SKY":
-                self._extract_sky(s, d)
-            elif msg_class == "PPS":
-                self._extract_pps(s, d)
-            elif msg_class == "TOFF":
-                self._extract_toff(s, d)
-            elif msg_class == "DEVICE":
-                self._extract_device(s, d)
-            elif msg_class == "DEVICES":
-                self._extract_devices(s, d)
-            elif msg_class == "VERSION":
-                self._extract_version(s, d)
-
-    def _extract_tpv(self, s, d: GPSData) -> None:
-        """Extract TPV (Time-Position-Velocity) data."""
+    def _apply_tpv(self, m: dict, d: GPSData, received: float) -> None:
+        """TPV (time-position-velocity). gpsd omits fields it doesn't know."""
         d.tpv_seq += 1
-        d.tpv_received = self._receipt_time or time.time()
-        f = s.fix
-        d.latitude = self._safe_float(f.latitude)
-        d.longitude = self._safe_float(f.longitude)
-        d.alt_hae = self._safe_float(f.altHAE)
-        d.alt_msl = self._safe_float(f.altMSL)
-        d.geoid_sep = self._safe_float(f.geoidSep)
-        d.speed = self._safe_float(f.speed)
-        d.track = self._safe_float(f.track)
-        d.climb = self._safe_float(f.climb)
-        d.mode = int(f.mode) if f.mode else 0
-        d.status = int(f.status) if f.status else 0
-        d.magtrack = self._safe_float(f.magtrack)
-        d.magvar = self._safe_float(f.magvar)
+        d.tpv_received = received
+        d.mode = _safe_int(m.get("mode"), 0)
+        # gpsd only reports status when it is DGPS or better; absent means a
+        # plain GPS fix (python-gps defaults it to STATUS_GPS) - or no fix.
+        default_status = 1 if d.mode >= 2 else 0
+        d.status = _safe_int(m.get("status"), default_status)
+        d.time = _safe_str(m.get("time"))
+        d.latitude = _safe_float(m.get("lat"))
+        d.longitude = _safe_float(m.get("lon"))
 
-        # Time
-        if f.time and not isinstance(f.time, float):
-            d.time = str(f.time)
-        elif s.utc:
-            d.time = str(s.utc)
-        else:
-            d.time = ""
+        alt_hae = _safe_float(m.get("altHAE"))
+        alt_msl = _safe_float(m.get("altMSL"))
+        geoid_sep = _safe_float(m.get("geoidSep"))
+        if "altMSL" not in m and "altHAE" not in m:
+            # gpsd < 3.20 only sends "alt" (MSL). Newer gpsd also sends the
+            # deprecated "alt", but altMSL/altHAE then take precedence.
+            alt_msl = _safe_float(m.get("alt"))
+        if not math.isfinite(alt_hae) and math.isfinite(alt_msl) and math.isfinite(geoid_sep):
+            alt_hae = alt_msl + geoid_sep
+        d.alt_hae = alt_hae
+        d.alt_msl = alt_msl
+        d.geoid_sep = geoid_sep
 
-        # Leap seconds (from TPV raw data)
-        raw = s.data if hasattr(s.data, "get") else {}
-        ls = raw.get("leapseconds", 0)
-        if ls:
-            d.leapseconds = int(ls)
+        d.speed = _safe_float(m.get("speed"))
+        d.track = _safe_float(m.get("track"))
+        d.climb = _safe_float(m.get("climb"))
+        d.magtrack = _safe_float(m.get("magtrack"))
+        d.magvar = _safe_float(m.get("magvar"))
+        if "leapseconds" in m:
+            d.leapseconds = _safe_int(m.get("leapseconds"), d.leapseconds)
 
-        # Error estimates
         d.errors = ErrorEstimates(
-            eph=self._safe_float(f.eph),
-            epv=self._safe_float(f.epv),
-            ept=self._safe_float(f.ept),
-            eps=self._safe_float(f.eps),
-            epd=self._safe_float(f.epd),
-            epc=self._safe_float(f.epc),
-            epx=self._safe_float(f.epx),
-            epy=self._safe_float(f.epy),
-            sep=self._safe_float(f.sep),
+            eph=_safe_float(m.get("eph")),
+            epv=_safe_float(m.get("epv")),
+            ept=_safe_float(m.get("ept")),
+            eps=_safe_float(m.get("eps")),
+            epd=_safe_float(m.get("epd")),
+            epc=_safe_float(m.get("epc")),
+            epx=_safe_float(m.get("epx")),
+            epy=_safe_float(m.get("epy")),
+            sep=_safe_float(m.get("sep")),
         )
 
-        # ECEF
-        d.ecefx = self._safe_float(f.ecefx)
-        d.ecefy = self._safe_float(f.ecefy)
-        d.ecefz = self._safe_float(f.ecefz)
-        d.ecefvx = self._safe_float(f.ecefvx)
-        d.ecefvy = self._safe_float(f.ecefvy)
-        d.ecefvz = self._safe_float(f.ecefvz)
+        d.ecefx = _safe_float(m.get("ecefx"))
+        d.ecefy = _safe_float(m.get("ecefy"))
+        d.ecefz = _safe_float(m.get("ecefz"))
+        d.ecefvx = _safe_float(m.get("ecefvx"))
+        d.ecefvy = _safe_float(m.get("ecefvy"))
+        d.ecefvz = _safe_float(m.get("ecefvz"))
 
-        # Compute TOFF: GPS time vs system clock (captured at message receipt)
-        # gpsd only sends TOFF messages with PPS hardware; we compute it here
-        # so it always works when there's a GPS time in the TPV.
+        self._compute_toff(d, received)
+
+    def _compute_toff(self, d: GPSData, received: float) -> None:
+        """TOFF from the TPV time vs. the system clock at receipt.
+
+        gpsd only sends TOFF reports with PPS-capable devices; computing it
+        here makes it work whenever a TPV carries a GPS time.
+        """
         gps_epoch = parse_gps_time(d.time) if d.time else None
-        if gps_epoch is not None and self._receipt_time > 0:
-            sys_epoch = self._receipt_time  # precise: captured right after s.read()
+        if gps_epoch is None or received <= 0:
+            return
+        sys_epoch = received
 
-            # Current TOFF for display
+        # A real gpsd TOFF message (PPS-capable devices) takes precedence
+        gpsd_toff_age = sys_epoch - self._gpsd_toff_received
+        if not (self._gpsd_toff_received > 0 and gpsd_toff_age < self.GPSD_TOFF_HOLD):
             gps_sec = int(gps_epoch)
-            gps_nsec = (gps_epoch - gps_sec) * 1e9
             sys_sec = int(sys_epoch)
-            sys_nsec = (sys_epoch - sys_sec) * 1e9
-
-            # A real gpsd TOFF message (PPS-capable devices) takes precedence
-            gpsd_toff_age = sys_epoch - self._gpsd_toff_received
-            if not (self._gpsd_toff_received > 0 and gpsd_toff_age < self.GPSD_TOFF_HOLD):
-                d.toff = TOFFData(
-                    real_sec=float(gps_sec),
-                    real_nsec=gps_nsec,
-                    clock_sec=float(sys_sec),
-                    clock_nsec=sys_nsec,
-                )
-
-            # Accumulate TOFF sample (offset in seconds)
-            offset = gps_epoch - sys_epoch
-            self._toff_buffer.append(offset)
-            d.toff_samples = list(self._toff_buffer)
-
-            # Armed mode: single-shot on next TPV with GPS time
-            if self.toff_armed:
-                self.toff_armed = False
-                d.toff_armed_offset = offset
-                d.toff_armed_gps_time = d.time
-                d.toff_armed_sys_time = sys_epoch
-
-    def _extract_sky(self, s, d: GPSData) -> None:
-        """Extract SKY (satellite) data."""
-        # DOP values from the session object
-        d.dop = DOPValues(
-            hdop=self._safe_float(s.hdop),
-            vdop=self._safe_float(s.vdop),
-            pdop=self._safe_float(s.pdop),
-            gdop=self._safe_float(s.gdop),
-            tdop=self._safe_float(s.tdop),
-            xdop=self._safe_float(s.xdop),
-            ydop=self._safe_float(s.ydop),
-        )
-
-        # Satellite data — use raw data dict for gnssid/svid fields
-        # Build list locally then assign atomically to avoid race with render()
-        raw_sats = s.data.get("satellites", []) if hasattr(s.data, "get") else []
-        new_sats = []
-        for raw in raw_sats:
-            sat = SatelliteInfo(
-                prn=int(raw.get("PRN", 0)),
-                gnssid=int(raw.get("gnssid", 0)),
-                svid=int(raw.get("svid", 0)),
-                elevation=self._safe_float(raw.get("el", float("nan"))),
-                azimuth=self._safe_float(raw.get("az", float("nan"))),
-                snr=self._safe_float(raw.get("ss", float("nan"))),
-                used=bool(raw.get("used", False)),
-                sigid=int(raw.get("sigid", 0)),
-                health=int(raw.get("health", 0)),
-                freqid=int(raw.get("freqid", -1)),
+            d.toff = TOFFData(
+                real_sec=float(gps_sec),
+                real_nsec=(gps_epoch - gps_sec) * 1e9,
+                clock_sec=float(sys_sec),
+                clock_nsec=(sys_epoch - sys_sec) * 1e9,
             )
-            new_sats.append(sat)
 
-        # Only replace satellite list if we got data; avoids clearing on
-        # empty SKY messages that some receivers send between updates
+        # Accumulate TOFF sample (offset in seconds)
+        offset = gps_epoch - sys_epoch
+        self._toff_buffer.append(offset)
+        d.toff_samples = list(self._toff_buffer)
+
+        # Armed mode: single-shot on next TPV with GPS time
+        if self.toff_armed:
+            self.toff_armed = False
+            d.toff_armed_offset = offset
+            d.toff_armed_gps_time = d.time
+            d.toff_armed_sys_time = sys_epoch
+
+    _DOP_KEYS = ("hdop", "vdop", "pdop", "gdop", "tdop", "xdop", "ydop")
+
+    def _apply_sky(self, m: dict, d: GPSData) -> None:
+        """SKY (satellites and DOPs).
+
+        gpsd >= 3.23 may send SKY reports with only DOPs, or only nSat/uSat,
+        so values that are absent keep their previous state.
+        """
+        if any(k in m for k in self._DOP_KEYS):
+            d.dop = DOPValues(**{k: _safe_float(m.get(k)) for k in self._DOP_KEYS})
+
+        raw_sats = m.get("satellites")
+        new_sats: list[SatelliteInfo] = []
+        if isinstance(raw_sats, list):
+            for raw in raw_sats:
+                if not isinstance(raw, dict):
+                    continue
+                new_sats.append(SatelliteInfo(
+                    prn=_safe_int(raw.get("PRN"), 0),
+                    gnssid=_safe_int(raw.get("gnssid"), 0),
+                    svid=_safe_int(raw.get("svid"), 0),
+                    elevation=_safe_float(raw.get("el")),
+                    azimuth=_safe_float(raw.get("az")),
+                    snr=_safe_float(raw.get("ss")),
+                    used=bool(raw.get("used", False)),
+                    sigid=_safe_int(raw.get("sigid"), 0),
+                    health=_safe_int(raw.get("health"), 0),
+                    freqid=_safe_int(raw.get("freqid"), -1),
+                ))
+
         if new_sats:
             d.satellites = new_sats
             d.satellites_used = sum(1 for sat in new_sats if sat.used)
+        elif "nSat" in m and _safe_int(m.get("nSat"), -1) == 0:
+            # gpsd explicitly reports an empty sky view
+            d.satellites = []
+            d.satellites_used = 0
+        elif "uSat" in m and not d.satellites:
+            # No satellite list, only the GGA "satellites used" count
+            d.satellites_used = _safe_int(m.get("uSat"), d.satellites_used)
 
-    def _extract_pps(self, s, d: GPSData) -> None:
-        """Extract PPS (Pulse Per Second) timing data."""
+    def _apply_pps(self, m: dict, d: GPSData) -> None:
         d.pps = PPSData(
-            real_sec=self._safe_float(s.real_sec),
-            real_nsec=self._safe_float(s.real_nsec),
-            clock_sec=self._safe_float(s.clock_sec),
-            clock_nsec=self._safe_float(s.clock_nsec),
-            precision=int(s.precision) if s.precision else 0,
-            qerr=self._safe_float(s.data.get("qErr", float("nan"))) if hasattr(s.data, "get") else float("nan"),
+            real_sec=_safe_float(m.get("real_sec")),
+            real_nsec=_safe_float(m.get("real_nsec")),
+            clock_sec=_safe_float(m.get("clock_sec")),
+            clock_nsec=_safe_float(m.get("clock_nsec")),
+            precision=_safe_int(m.get("precision"), 0),
+            qerr=_safe_float(m.get("qErr")),
         )
 
-    def _extract_toff(self, s, d: GPSData) -> None:
-        """Extract TOFF (Time Offset) data."""
-        self._gpsd_toff_received = self._receipt_time or time.time()
-        raw = s.data if hasattr(s.data, "get") else {}
+    def _apply_toff(self, m: dict, d: GPSData, received: float) -> None:
+        self._gpsd_toff_received = received
         d.toff = TOFFData(
-            real_sec=self._safe_float(raw.get("real_sec", float("nan"))),
-            real_nsec=self._safe_float(raw.get("real_nsec", float("nan"))),
-            clock_sec=self._safe_float(raw.get("clock_sec", float("nan"))),
-            clock_nsec=self._safe_float(raw.get("clock_nsec", float("nan"))),
+            real_sec=_safe_float(m.get("real_sec")),
+            real_nsec=_safe_float(m.get("real_nsec")),
+            clock_sec=_safe_float(m.get("clock_sec")),
+            clock_nsec=_safe_float(m.get("clock_nsec")),
         )
 
-    def _extract_device(self, s, d: GPSData) -> None:
-        """Extract DEVICE information."""
-        raw = s.data if hasattr(s.data, "get") else {}
+    @staticmethod
+    def _device_info(dev: dict) -> DeviceInfo:
+        return DeviceInfo(
+            path=_safe_str(dev.get("path")),
+            driver=_safe_str(dev.get("driver")),
+            subtype=_safe_str(dev.get("subtype")),
+            bps=_safe_int(dev.get("bps"), 0),
+            cycle=_safe_float(dev.get("cycle")),
+            mincycle=_safe_float(dev.get("mincycle")),
+            activated=_safe_str(dev.get("activated")),
+            native=_safe_int(dev.get("native"), 0),
+        )
+
+    def _apply_device(self, m: dict, d: GPSData) -> None:
+        """DEVICE: a device was added/changed. Fields absent keep their value."""
+        prev = d.device
+        path = _safe_str(m.get("path"))
+        if prev.path and path and path != prev.path:
+            prev = DeviceInfo()  # a different device: don't mix fields
+        new = self._device_info(m)
         d.device = DeviceInfo(
-            path=str(raw.get("path", s.path or "")),
-            driver=str(s.gps_id or ""),
-            subtype=str(raw.get("subtype", "")),
-            bps=int(s.baudrate) if s.baudrate else 0,
-            cycle=self._safe_float(s.cycle),
-            mincycle=self._safe_float(s.mincycle),
-            activated=str(raw.get("activated", "")),
-            native=int(raw.get("native", 0)),
+            path=path or prev.path,
+            driver=new.driver if "driver" in m else prev.driver,
+            subtype=new.subtype if "subtype" in m else prev.subtype,
+            bps=new.bps if "bps" in m else prev.bps,
+            cycle=new.cycle if "cycle" in m else prev.cycle,
+            mincycle=new.mincycle if "mincycle" in m else prev.mincycle,
+            activated=new.activated if "activated" in m else prev.activated,
+            native=new.native if "native" in m else prev.native,
         )
 
-    def _extract_devices(self, s, d: GPSData) -> None:
-        """Extract device info from a DEVICES (plural) message."""
-        raw = s.data if hasattr(s.data, "get") else {}
-        devices = raw.get("devices", [])
-        if devices:
-            dev = devices[0]
-            dev_get = dev.get if hasattr(dev, "get") else lambda k, default=None: default
-            d.device = DeviceInfo(
-                path=str(dev_get("path", "")),
-                driver=str(dev_get("driver", "")),
-                subtype=str(dev_get("subtype", "")),
-                bps=int(dev_get("bps", 0)),
-                cycle=self._safe_float(dev_get("cycle", float("nan"))),
-                mincycle=self._safe_float(dev_get("mincycle", float("nan"))),
-                activated=str(dev_get("activated", "")),
-                native=int(dev_get("native", 0)),
-            )
+    def _apply_devices(self, m: dict, d: GPSData) -> None:
+        """DEVICES: the device list; show the first device that has a path."""
+        devices = [dev for dev in m.get("devices") or [] if isinstance(dev, dict)]
+        if not devices:
+            return
+        chosen = next((dev for dev in devices if dev.get("path")), devices[0])
+        d.device = self._device_info(chosen)
 
-    def _extract_version(self, s, d: GPSData) -> None:
-        """Extract VERSION information."""
-        v = s.version if s.version and hasattr(s.version, "get") else {}
+    def _apply_version(self, m: dict, d: GPSData) -> None:
         d.version = VersionInfo(
-            release=str(v.get("release", "")),
-            proto_major=int(v.get("proto_major", 0)),
-            proto_minor=int(v.get("proto_minor", 0)),
+            release=_safe_str(m.get("release")),
+            proto_major=_safe_int(m.get("proto_major"), 0),
+            proto_minor=_safe_int(m.get("proto_minor"), 0),
         )

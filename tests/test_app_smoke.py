@@ -1,8 +1,9 @@
 """Headless Pilot smoke tests for the full TuiGPS app.
 
-The fake ``gps`` module refuses connections by default, so the real
-GPSDClient thread starts, fails to connect and reports errors through the
-normal callback path. Data is then injected directly.
+In tests the client's default gpsd port refuses connections (see conftest),
+so the real GPSDClient thread starts, fails to connect and reports errors
+through the normal callback path. Data is then injected directly, or streamed
+by the fake gpsd server.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from textual.widgets import Button, Input, RichLog, Select, TabbedContent
 from tuigps import app as app_module
 from tuigps.app import TuiGPS
 from tuigps.data_model import GPSData
+from tuigps.gpsd_client import GPSDClient
 from tuigps.screens.settings_screen import SettingsScreen
 from tuigps.widgets.connection_status import ConnectionStatus
 from tuigps.widgets.device_config import DeviceConfig
@@ -48,24 +50,44 @@ def render_all(app: TuiGPS) -> dict[str, str]:
     return {wid: app.query_one(f"#{wid}").render().plain for wid in WIDGET_IDS}
 
 
-async def test_app_mounts_with_failing_gpsd(fake_gps):
+async def test_app_mounts_with_failing_gpsd():
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
         await pilot.pause()
         assert app._gpsd._thread is not None and app._gpsd._thread.is_alive()
         # The client thread attempted to connect and failed
-        for _ in range(50):
-            if fake_gps.gps.calls and app._gpsd.data.error_message:
+        for _ in range(100):
+            if app._gpsd.data.error_message:
                 break
             await pilot.pause(0.02)
-        assert fake_gps.gps.calls
         assert "Connection refused" in app._gpsd.data.error_message
         assert not app._gpsd.data.connected
         assert app.theme == "textual-dark"
+        await pilot.pause(0.05)
         status = app.query_one("#w-connection", ConnectionStatus).render().plain
         assert "DISCONNECTED" in status
     # on_unmount stops the client
     assert app._gpsd._running is False
+
+
+async def test_app_shows_data_from_fake_gpsd(fake_gpsd):
+    """End to end: fake gpsd -> native client -> dashboard widgets."""
+    from tests.test_gpsd_client import DEVICES_325, SKY_325, TPV_325
+
+    fake_gpsd.add(DEVICES_325, TPV_325, SKY_325)
+    app = TuiGPS()
+    app._gpsd = GPSDClient("127.0.0.1", fake_gpsd.port)
+    async with app.run_test(size=SIZE) as pilot:
+        for _ in range(150):
+            if app._gps_data.satellites and app._gps_data.has_fix:
+                break
+            await pilot.pause(0.02)
+        await pilot.pause(0.05)
+        assert fake_gpsd.received.startswith(b"?WATCH=")
+        assert "47.606200" in app.query_one("#w-position").render().plain
+        status = app.query_one("#w-connection", ConnectionStatus).render().plain
+        assert "3D Fix" in status and "DGPS" in status
+        assert "/dev/ttyACM0" in status
 
 
 async def test_every_tab_activates_and_renders(make_gps_data):
@@ -192,7 +214,7 @@ async def test_key_maps(make_gps_data, opened_urls):
     assert opened_urls == ["https://maps.google.com/?q=47.606200,-122.332100"]
 
 
-async def test_key_reconnect(fake_gps, make_gps_data):
+async def test_key_reconnect(make_gps_data):
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
         old_thread = app._gpsd._thread
@@ -205,8 +227,8 @@ async def test_key_reconnect(fake_gps, make_gps_data):
         assert app._gps_data is not old_data
         assert app._gpsd._running
         # F4: client data was reset too, so the UI and the client agree
-        assert app._gps_data is app._gpsd.data
-        assert not app._gps_data.has_fix
+        assert app._gps_data.tpv_seq == 0 == app._gpsd.data.tpv_seq
+        assert not app._gps_data.has_fix and not app._gpsd.data.has_fix
         assert app._last_tpv_seq == 0  # the new session's first TPV (seq 1) is new
         # ...and only the new polling thread is alive
         assert not old_thread.is_alive()
@@ -253,7 +275,14 @@ async def test_settings_apply_same_host_keeps_client():
         assert app._gpsd is client
 
 
-async def test_settings_apply_new_host_reconnects(fake_gps):
+async def test_settings_apply_new_host_reconnects(monkeypatch):
+    attempts = []
+
+    def fake_open(self, stop):
+        attempts.append((self.host, self.port))
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(GPSDClient, "_open_socket", fake_open)
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
         old = app._gpsd
@@ -267,10 +296,10 @@ async def test_settings_apply_new_host_reconnects(fake_gps):
         assert (app._gpsd.host, app._gpsd.port) == ("10.0.0.5", "3000")
         assert old._running is False
         for _ in range(50):
-            if any(c["host"] == "10.0.0.5" for c in fake_gps.gps.calls):
+            if ("10.0.0.5", "3000") in attempts:
                 break
             await pilot.pause(0.02)
-        assert any(c["host"] == "10.0.0.5" and c["port"] == "3000" for c in fake_gps.gps.calls)
+        assert ("10.0.0.5", "3000") in attempts
 
 
 async def test_arm_and_clear_toff(make_gps_data):
@@ -387,9 +416,9 @@ def test_hold_counts_each_fix_once(make_gps_data):
     assert app._hold.fix_count == 2
 
 
-def test_hold_and_log_follow_client_tpv_epochs(fake_session, tpv_session, tmp_path):
+def test_hold_and_log_follow_client_tpv_epochs(tmp_path):
     """End to end through GPSDClient: one hold/log entry per TPV message."""
-    from tuigps.gpsd_client import GPSDClient
+    from tests.test_gpsd_client import GGA, PPS_325, SKY_325, WATCH_325, tpv
 
     app = TuiGPS()
     app._hold.start()
@@ -398,21 +427,14 @@ def test_hold_and_log_follow_client_tpv_epochs(fake_session, tpv_session, tmp_pa
     app._gps_logger.start()
     client = GPSDClient()
     client._on_update = app._on_gpsd_update
-    tpv = tpv_session()
-    times = ["2026-03-14T12:00:00Z", "2026-03-14T12:00:01Z"]
-    for t in times:
-        tpv.fix.time = t
-        tpv.data = {"class": "TPV"}
-        client._extract_data(tpv)
-        client._notify_update()
-        for cls in ("SKY", "PPS", "WATCH"):  # same fix, other message classes
-            client._extract_data(fake_session(data={"class": cls}))
-            client._notify_update()
+    for t in ["2026-03-14T12:00:00Z", "2026-03-14T12:00:01Z"]:
+        client._handle_line(tpv(time=t))
+        for line in (SKY_325, PPS_325, WATCH_325, GGA):  # same fix, other messages
+            client._handle_line(line)
     app._gps_logger.stop()
     assert client.data.tpv_seq == 2
     assert app._hold.fix_count == 2
     assert app._gps_logger.fix_count == 2
-
 
 
 async def test_failing_widget_update_is_logged_not_fatal(make_gps_data, monkeypatch, caplog):
