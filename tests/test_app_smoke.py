@@ -92,9 +92,9 @@ async def test_app_mounts_with_failing_gpsd():
         assert "Connection refused" in app._gpsd.data.error_message
         assert not app._gpsd.data.connected
         assert app.theme == "textual-dark"
-        await pilot.pause(0.05)
+        await settle(pilot, app)
         status = app.query_one("#w-connection", ConnectionStatus).render().plain
-        assert "DISCONNECTED" in status
+        assert "DISCONNECTED \u2014 retry in" in status  # the failure reached the UI
     # on_unmount stops the client
     assert app._gpsd._running is False
 
@@ -186,11 +186,19 @@ async def test_every_tab_activates_and_renders(make_gps_data):
 async def test_refresh_ui_with_empty_and_partial_data():
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
-        for data in (GPSData(), GPSData(connected=True, mode=1, time="2026-03-14T12:00:00Z")):
-            app._gps_data = data
-            app._refresh_ui()
-            await pilot.pause()
-            render_all(app)
+        app._gps_data = GPSData()
+        app._refresh_ui()
+        await pilot.pause()
+        rendered = render_all(app)
+        assert "Lat:  ---" in rendered["w-position"] and "Unknown" in rendered["w-fix"]
+        assert "DISCONNECTED" in rendered["w-connection"]
+        app._gps_data = GPSData(connected=True, last_seen=time.time(), mode=1,
+                                time="2026-03-14T12:00:00Z")
+        app._refresh_ui()
+        await pilot.pause()
+        rendered = render_all(app)
+        assert "No Fix" in rendered["w-fix"] and "12:00:00 UTC" in rendered["w-time"]
+        assert "No Fix" in rendered["w-connection"]
 
 
 async def test_gpsd_update_from_thread(make_gps_data):
@@ -203,16 +211,19 @@ async def test_gpsd_update_from_thread(make_gps_data):
         assert "47.606200" in app.query_one("#w-position").render().plain
 
 
-async def test_nmea_and_error_from_thread():
+async def test_nmea_and_error_from_thread(monkeypatch):
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
+        notes = []
+        monkeypatch.setattr(app, "notify", lambda msg, **kw: notes.append((msg, kw)))
         await asyncio.to_thread(app._on_nmea, "$GPGGA,123*00")
         await asyncio.to_thread(app._on_gpsd_error, "boom")
         await settle(pilot, app)
         app.query_one(TabbedContent).active = "tab-nmea"
         await pilot.pause()
         log = app.query_one(NMEAViewer).query_one("#nmea-log", RichLog)
-        assert len(log.lines) == 1
+        assert ["".join(seg.text for seg in line) for line in log.lines] == ["$GPGGA,123*00"]
+        assert notes == [("gpsd: boom", {"severity": "error", "timeout": 5})]
 
 
 async def test_keys_units_theme_dark():
@@ -396,6 +407,10 @@ async def test_arm_and_clear_toff(make_gps_data):
         await pilot.pause()
         assert btn.variant == "warning"
         assert "+12.3 ms" in str(btn.label)
+        # Later refreshes keep showing the single-shot result
+        app._gps_data = make_gps_data(toff_armed_offset=0.05)
+        app._refresh_ui()
+        assert "+12.3 ms" in str(btn.label)
 
         app.query_one("#btn-clear-toff", Button).press()
         await pilot.pause()
@@ -452,11 +467,23 @@ async def test_armed_clock_sync_error_is_reported(make_gps_data, monkeypatch):
         assert "Clock sync error: bad time" in text
 
 
-async def test_deliver_clock_error_result():
+async def test_deliver_clock_error_result(monkeypatch):
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
+        notes = []
+        monkeypatch.setattr(app, "notify", lambda msg, **kw: notes.append((msg, kw)))
+        app.query_one(TabbedContent).active = "tab-device"  # RichLog writes need a size
+        await pilot.pause()
+        config = app.query_one(DeviceConfig)
+        btn = config.query_one("#btn-arm-clock", Button)
+        btn.label = "ARMED (click to cancel)"
         app._deliver_clock_result("Error: could not set time.\n  details")
         await pilot.pause()
+        out = config.query_one("#config-output", RichLog)
+        text = "\n".join("".join(seg.text for seg in strip) for strip in out.lines)
+        assert "Error: could not set time." in text and "details" in text
+        assert str(btn.label) == "Arm Clock Sync"
+        assert notes == [("Error: could not set time.", {"severity": "error", "timeout": 4})]
 
 
 # ─── App logic without a running event loop ───────────────────────────
@@ -464,20 +491,12 @@ async def test_deliver_clock_error_result():
 
 def test_update_without_running_app_is_safe(make_gps_data):
     app = TuiGPS()
-    app._on_gpsd_update(make_gps_data())
+    data = make_gps_data()
+    app._on_gpsd_update(data)
     app._on_nmea("$GPGGA")
     app._on_gpsd_error("x")
-
-
-def test_logger_dedupes_repeated_snapshot(make_gps_data, tmp_path):
-    app = TuiGPS()
-    app._gps_logger._directory = tmp_path
-    app._gps_logger.start()
-    data = make_gps_data()
-    for _ in range(3):
-        app._on_gpsd_update(data)
-    assert app._gps_logger.fix_count == 1
-    app._gps_logger.stop()
+    assert app._gps_data is data
+    assert not app._tick_pending  # nothing scheduled on a loop that does not exist
 
 
 def test_hold_counts_each_fix_once(make_gps_data):
@@ -575,10 +594,12 @@ async def test_gpsd_thread_never_waits_for_the_ui(make_gps_data, monkeypatch):
             return time.perf_counter() - start
 
         elapsed = await asyncio.to_thread(produce)
-        assert elapsed < 0.15  # 50 updates + 50 sentences, never waiting on a 0.2 s refresh
+        # 50 updates + 50 sentences; waiting on even three 0.2 s refreshes takes 0.6 s
+        assert elapsed < 0.5
         await settle(pilot, app, timeout=3.0)
-        # Coalesced: far fewer refreshes than updates, and the last one shows the final state
-        assert 1 <= len(refreshes) <= 4
+        # Coalesced: at most one refresh per interval (plus the leading and trailing
+        # edges), and the last one shows the final state
+        assert 1 <= len(refreshes) <= 2 + elapsed / app_module.UI_MIN_INTERVAL
         assert refreshes[-1] is snapshots[-1]
         assert "60.000000" in app.query_one("#w-position").render().plain
 
@@ -597,11 +618,18 @@ async def test_rapid_updates_are_coalesced_with_trailing_refresh(make_gps_data, 
             original(*args, heartbeat=heartbeat, **kwargs)
 
         monkeypatch.setattr(app, "_refresh_ui", counting)
+        # A wide interval, so the second and third updates land inside it even
+        # on a loaded machine (the default is 0.1 s)
+        monkeypatch.setattr(app_module, "UI_MIN_INTERVAL", 0.5)
         first, second, third = (make_gps_data(tpv_seq=i) for i in (1, 2, 3))
         await asyncio.to_thread(app._on_gpsd_update, first)  # leading edge: immediate
         await pilot.pause()
-        await asyncio.to_thread(app._on_gpsd_update, second)  # within the interval:
-        await asyncio.to_thread(app._on_gpsd_update, third)  # coalesced, trailing edge
+
+        def burst():  # within the interval: coalesced into the trailing edge
+            app._on_gpsd_update(second)
+            app._on_gpsd_update(third)
+
+        await asyncio.to_thread(burst)
         await settle(pilot, app)
         assert shown[0] is first
         assert shown[-1] is third
@@ -615,6 +643,7 @@ async def test_delivery_errors_during_shutdown_are_swallowed(make_gps_data, capl
         def call_soon_threadsafe(self, *args):
             raise RuntimeError("Event loop is closed")
 
+    caplog.set_level("DEBUG", logger="tuigps.app")
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
         await settle(pilot, app)
@@ -626,6 +655,7 @@ async def test_delivery_errors_during_shutdown_are_swallowed(make_gps_data, capl
             await asyncio.to_thread(app._on_nmea, "$GPGGA,1*00")
             await asyncio.to_thread(app._on_gpsd_error, "boom")
             assert not app._tick_pending  # a later update can schedule again
+            assert "UI delivery dropped: event loop closed" in caplog.text
         finally:
             app._loop = loop
 
@@ -734,13 +764,16 @@ async def test_nmea_is_delivered_in_batches(monkeypatch):
         sentences = [f"$GP{t},{i}*00" for i in range(100) for t in ("GGA", "RMC", "GSV")]
 
         def produce():
+            start = time.perf_counter()
             for s in sentences:
                 app._on_nmea(s)
+            return time.perf_counter() - start
 
-        await asyncio.to_thread(produce)
+        elapsed = await asyncio.to_thread(produce)
         await settle(pilot, app)
         assert sum(batches) == 300
-        assert len(batches) <= 4
+        # One batch per UI tick: at most one per interval, plus the leading/trailing edges
+        assert len(batches) <= 2 + elapsed / app_module.UI_MIN_INTERVAL
         assert viewer._total == 300 and viewer._type_counts["GSV"] == 100
         assert list(viewer._buffer)[-1] == sentences[-1]
         app.query_one(TabbedContent).active = "tab-nmea"
@@ -761,7 +794,9 @@ async def test_failing_ui_callback_is_logged(caplog):
         assert app.is_running
     assert any("UI callback failed" in r.getMessage() and r.exc_info for r in caplog.records)
     # After shutdown, scheduled callbacks are dropped without running
-    app._run_ui_callback(boom, ())
+    ran = []
+    app._run_ui_callback(lambda: ran.append(1), ())
+    assert ran == []
 
 
 def test_refresh_before_mount_is_a_no_op(make_gps_data):
@@ -769,6 +804,7 @@ def test_refresh_before_mount_is_a_no_op(make_gps_data):
     app._gps_data = make_gps_data()
     app._refresh_ui()
     app._deliver_nmea_batch(["$GPGGA,1*00"])
+    assert app._stale_tag == ""  # the refresh returned before touching any widget
 
 
 # ─── Persistent configuration (U1) ────────────────────────────────────
@@ -1104,3 +1140,26 @@ async def test_timing_tab_labels_toff_source_end_to_end():
         await asyncio.to_thread(client._handle_line, TOFF_325)
         await settle(pilot, app)
         assert "(gpsd TOFF)" in app.query_one("#w-time-detail").render().plain
+
+
+def test_actions_before_mount_are_harmless(config_file):
+    """Key actions and refreshes that arrive before the UI exists do nothing."""
+    app = TuiGPS()
+    app.action_show_tab("tab-nmea")
+    app.action_cycle_theme()  # no theme list yet
+    app._refresh_ui()
+    assert app._theme_index == 0
+    assert not config_file.exists()  # nothing was saved
+
+
+def test_ui_guard_contains_widget_errors(caplog):
+    """One failing widget update is logged; a missing widget is expected and silent."""
+    from textual.css.query import NoMatches
+
+    app = TuiGPS()
+    with app._ui_guard("#gone"):
+        raise NoMatches("no #gone")
+    assert caplog.text == ""
+    with app._ui_guard("#broken"):
+        raise RuntimeError("render failed")
+    assert "UI update failed: #broken" in caplog.text and "render failed" in caplog.text

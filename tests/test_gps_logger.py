@@ -203,21 +203,28 @@ def test_log_point_after_stop_from_other_thread_is_safe(tmp_path, make_gps_data)
     import threading
 
     lg = GPSLogger(directory=str(tmp_path), fmt="csv")
-    lg.start()
+    path = lg.start()
     errors = []
+    writing = threading.Event()
 
     def writer():
         try:
-            for i in range(500):
+            for i in range(2000):
                 lg.log_point(make_gps_data(time=f"t{i}"))
+                if i == 20:
+                    writing.set()  # stop() now races with the remaining writes
         except Exception as exc:  # pragma: no cover - failure path
             errors.append(exc)
 
     t = threading.Thread(target=writer)
     t.start()
+    assert writing.wait(5)
     lg.stop()
     t.join()
     assert errors == []
+    rows = path.read_text().splitlines()
+    assert len(rows) == lg.fix_count + 1  # header + every counted point, none after stop
+    assert lg.fix_count > 20
 
 
 class TestCSV:
@@ -315,6 +322,14 @@ def test_configure_applies_to_next_start(tmp_path, make_gps_data):
     second = lg.start()
     lg.stop()
     assert second.parent == tmp_path / "two" and second.suffix == ".csv"
+
+
+def test_configure_format_only_keeps_directory(tmp_path):
+    lg = GPSLogger(directory=tmp_path / "logs", fmt="gpx")
+    lg.configure(fmt="csv")
+    assert (lg.directory, lg.format) == (tmp_path / "logs", "csv")
+    lg.configure(directory=tmp_path)
+    assert (lg.directory, lg.format) == (tmp_path, "csv")
 
 
 def test_start_while_active_finishes_previous_file(tmp_path, make_gps_data):

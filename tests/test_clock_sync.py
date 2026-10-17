@@ -130,6 +130,7 @@ def test_sudo_fallback(monkeypatch, now):
 
 
 def test_total_failure_message(monkeypatch, now):
+    """N5: each fallback's own stderr is shown under its own label, plus a tip."""
     monkeypatch.setenv("USER", "alice")
     _install(
         monkeypatch,
@@ -141,17 +142,6 @@ def test_total_failure_message(monkeypatch, now):
     assert msg.startswith("Error: could not set time.")
     assert "set-ntp false" in msg
     assert "alice ALL=(ALL) NOPASSWD: /usr/bin/date" in msg
-
-
-def test_total_failure_reports_each_methods_stderr(monkeypatch, now):
-    """N5: each fallback's own stderr is shown under its own label."""
-    _install(
-        monkeypatch,
-        busctl=(1, "", "busctl-err"),
-        timedatectl_set_time=(1, "", "timedatectl-err"),
-        sudo=(1, "", "sudo-err"),
-    )
-    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
     assert "busctl: busctl-err" in msg
     assert "timedatectl: timedatectl-err" in msg
     assert "sudo: sudo-err" in msg

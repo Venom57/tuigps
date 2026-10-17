@@ -35,7 +35,9 @@ include = ["src/tuigps"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 # Run the tests in parallel (pytest-xdist): the Pilot tests are CPU-bound.
-# Use -n0 for a single serial process (e.g. with pdb or to see print output).
+# This needs pytest-xdist (pip install -e '.[dev]'); without it pytest fails
+# with "unrecognized arguments: -n". Use -n0 for a single serial process
+# (e.g. with pdb or to see print output).
 addopts = "-n auto"
 markers = [
     "live_gpsd: run the real gpsd client thread in app tests",
@@ -47,3 +49,6 @@ branch = true
 
 [tool.coverage.report]
 show_missing = true
+
+[tool.coverage.html]
+directory = "htmlcov"

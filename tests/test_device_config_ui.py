@@ -203,22 +203,6 @@ async def test_pps_sync_without_device(make_gps_data, monkeypatch):
         assert "no PPS device found" in log_text(w)
 
 
-async def test_arm_clock_toggle():
-    app = Harness()
-    async with app.run_test(size=(140, 50)) as pilot:
-        w = app.query_one(DeviceConfig)
-        btn = w.query_one("#btn-arm-clock", Button)
-        await press(pilot, w, "btn-arm-clock")
-        await answer(pilot, app, True)
-        assert app._armed_clock_set is True
-        assert btn.variant == "success"
-        await press(pilot, w, "btn-arm-clock")
-        assert app._armed_clock_set is False
-        assert str(btn.label) == "Arm Clock Sync"
-        out = log_text(w)
-    assert "Clock sync ARMED" in out and "Clock sync disarmed" in out
-
-
 async def test_set_clock_now_uses_clock_sync(make_gps_data, monkeypatch):
     calls = []
 
@@ -437,3 +421,174 @@ async def test_pps_sync_success_leaves_ntp_off(make_gps_data, monkeypatch):
         await answer(pilot, app, True)
         assert await wait_for(pilot, lambda: dc.NTP_DISABLED_HINT in log_text(w))
     assert ["timedatectl", "set-ntp", "true"] not in calls
+
+
+# ─── Serial speed change: every outcome is reported ─────────────────────
+
+
+def _scripted_run(monkeypatch, outcomes: dict):
+    """subprocess.run whose result per program is a (rc, out, err) tuple or an exception."""
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        outcome = outcomes.get(cmd[0], (0, "", ""))
+        if isinstance(outcome, BaseException):
+            raise outcome
+        return subprocess.CompletedProcess(cmd, *outcome)
+
+    monkeypatch.setattr(dc.subprocess, "run", fake_run)
+    return calls
+
+
+@pytest.mark.parametrize("outcomes, device, expected", [
+    ({"ubxtool": (0, "UBX-CFG-PRT sent\n", "warning: slow\n")}, "/dev/ttyACM0",
+     ["UBX-CFG-PRT sent", "warning: slow", "Baud rate set to 38400 on /dev/ttyACM0"]),
+    ({}, "", ["Baud rate set to 38400 on default device"]),
+    ({"gpsctl": (1, "", "gpsctl: device busy\n")}, "/dev/ttyACM0", ["gpsctl: gpsctl: device busy"]),
+    ({"gpsctl": (2, "", "")}, "/dev/ttyACM0", ["gpsctl returned 2"]),
+    ({"ubxtool": FileNotFoundError(2, "No such file", "ubxtool")}, "", ["Error: ubxtool not found"]),
+    ({"gpsctl": subprocess.TimeoutExpired("gpsctl", 10)}, "", ["Error: command timed out"]),
+    ({"ubxtool": RuntimeError("boom")}, "", ["Error: boom"]),
+])
+async def test_set_baud_rate_outcomes(outcomes, device, expected, monkeypatch):
+    calls = _scripted_run(monkeypatch, outcomes)
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w._device_path = device
+        w._set_baud_rate(38400)
+        assert await wait_for(pilot, lambda: expected[-1] in log_text(w))
+        out = log_text(w)
+    for line in expected:
+        assert line in out
+    if "gpsctl" in [c[0] for c in calls]:
+        gpsctl = next(c for c in calls if c[0] == "gpsctl")
+        assert gpsctl == ["gpsctl", "-s", "38400"] + ([device] if device else [])
+
+
+@pytest.mark.parametrize("error, expected", [
+    (subprocess.TimeoutExpired("ubxtool", 10), "Error: command timed out"),
+    (PermissionError(13, "Permission denied"), "Error: [Errno 13] Permission denied"),
+])
+async def test_run_ubxtool_errors_are_reported(error, expected, monkeypatch):
+    _scripted_run(monkeypatch, {"ubxtool": error})
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w._run_ubxtool("-p MON-VER")
+        assert await wait_for(pilot, lambda: expected in log_text(w))
+
+
+async def test_run_ubxtool_without_output(monkeypatch):
+    _scripted_run(monkeypatch, {"ubxtool": (0, "\n", "")})
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w._run_ubxtool("-p SAVE")
+        assert await wait_for(pilot, lambda: "(no output)" in log_text(w))
+
+
+# ─── Clock actions when the data changes under the dialog ───────────────
+
+
+async def test_set_clock_rechecks_gps_time_after_confirmation(make_gps_data, monkeypatch):
+    """The data can go away while the dialog is open (e.g. a reconnect)."""
+    from tuigps.data_model import GPSData
+
+    monkeypatch.setattr(dc, "set_clock_from_gps", lambda *a: pytest.fail("clock set"))
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data())
+        await press(pilot, w, "btn-set-clock")
+        w.update_gps_data(GPSData())
+        await answer(pilot, app, True)
+        assert "Error: no GPS time available" in log_text(w)
+
+
+async def test_set_clock_error_is_reported(make_gps_data, monkeypatch):
+    def fail(gps_time, received):
+        raise ValueError(f"invalid GPS time: {gps_time!r}")
+
+    monkeypatch.setattr(dc, "set_clock_from_gps", fail)
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data())
+        await press(pilot, w, "btn-set-clock")
+        await answer(pilot, app, True)
+        assert await wait_for(pilot, lambda: "Error: invalid GPS time" in log_text(w))
+
+
+async def test_pps_sync_rechecks_after_confirmation(make_gps_data, monkeypatch):
+    calls, overrides = _pps_setup(monkeypatch, {})
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(**overrides))
+        await press(pilot, w, "btn-pps-sync")
+        monkeypatch.setattr(dc.glob, "glob", lambda pat: [])  # PPS device unplugged
+        await answer(pilot, app, True)
+        await pilot.pause(0.05)
+        out = log_text(w)
+    assert "no PPS device found" in out and "waiting for pulse" not in out
+    assert calls == []
+
+
+async def test_pps_sync_without_a_pulse(make_gps_data, monkeypatch):
+    """Timeout or EACCES on /dev/pps0: reported with a permission hint, clock untouched."""
+    calls, overrides = _pps_setup(monkeypatch, {})
+    monkeypatch.setattr(DeviceConfig, "_wait_for_pps", staticmethod(lambda p, timeout_sec=3: None))
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(**overrides))
+        await press(pilot, w, "btn-pps-sync")
+        await answer(pilot, app, True)
+        assert await wait_for(pilot, lambda: "PPS fetch failed on /dev/pps0" in log_text(w))
+        assert "ls -la /dev/pps0" in log_text(w)
+    assert calls == []  # NTP left alone, clock not touched
+
+
+async def test_pps_sync_sudo_fallback(make_gps_data, monkeypatch):
+    calls, overrides = _pps_setup(monkeypatch, {"busctl": (1, "denied")})
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(**overrides))
+        await press(pilot, w, "btn-pps-sync")
+        await answer(pilot, app, True)
+        assert await wait_for(pilot, lambda: "sudo fallback" in log_text(w))
+        out = log_text(w)
+    assert "System clock set to 2026-03-14 12:00:01 UTC (sudo fallback, ~1s precision)" in out
+    assert dc.NTP_DISABLED_HINT in out
+    assert calls[-1] == ["sudo", "-n", "date", "-u", "-s", "2026-03-14 12:00:01"]
+
+
+async def test_pps_sync_unexpected_error_is_reported(make_gps_data, monkeypatch):
+    calls, overrides = _pps_setup(monkeypatch, {})
+
+    def broken(path, timeout_sec=3):
+        raise RuntimeError("ioctl exploded")
+
+    monkeypatch.setattr(DeviceConfig, "_wait_for_pps", staticmethod(broken))
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(**overrides))
+        await press(pilot, w, "btn-pps-sync")
+        await answer(pilot, app, True)
+        assert await wait_for(pilot, lambda: "PPS sync error: ioctl exploded" in log_text(w))
+        assert app.is_running
+
+
+# ─── Results delivered while the widget is not mounted ──────────────────
+
+
+async def test_unmounted_widget_ignores_late_results():
+    """Worker results can arrive during shutdown, after the widget is gone."""
+    w = DeviceConfig()
+    w._append_output("late result")  # no log to write to: ignored
+    w._update_gnss_buttons()  # no buttons: ignored
+    await w._load_ntp_state()  # no NTP label: ignored

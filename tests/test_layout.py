@@ -92,3 +92,21 @@ async def test_dashboard_relayouts_on_resize(make_gps_data):
         app._gps_data = make_gps_data(latitude=10.5)
         app._refresh_ui()
         assert "10.500000" in app.query_one("#w-position").render().plain
+
+
+async def test_resize_while_a_dialog_is_open(make_gps_data):
+    """The dashboard follows a resize that happens behind a modal (settings, help)."""
+    from tuigps.screens.help_screen import HelpScreen
+
+    app = TuiGPS()
+    async with app.run_test(size=(130, 45)) as pilot:
+        await show(app, pilot, make_gps_data)
+        await pilot.press("question_mark")
+        assert isinstance(app.screen, HelpScreen)
+        await pilot.resize_terminal(70, 30)
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        grid = app.query_one("#dashboard-grid")
+        assert grid.has_class("-narrow")
+        assert [w.id for w in grid.children] == list(DASHBOARD_ORDER["-narrow"])

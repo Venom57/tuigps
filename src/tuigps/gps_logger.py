@@ -138,7 +138,7 @@ class GPSLogger:
                 "    <name>tuigps log</name>\n"
                 "    <trkseg>\n"
             )
-        elif self._file_format == "csv":
+        else:  # csv
             self._file.write(
                 "timestamp,latitude,longitude,alt_msl,speed,track,"
                 "mode,status,hdop,eph,epv,satellites_used\n"
@@ -152,17 +152,16 @@ class GPSLogger:
 
     def _stop(self) -> None:
         if not self._active:
-            return
-        if self._file:
-            if self._file_format == "gpx":
-                self._file.write(
-                    "    </trkseg>\n"
-                    "  </trk>\n"
-                    "</gpx>\n"
-                )
-            self._file.flush()
-            self._file.close()
-            self._file = None
+            return  # an active logger always has an open file
+        if self._file_format == "gpx":
+            self._file.write(
+                "    </trkseg>\n"
+                "  </trk>\n"
+                "</gpx>\n"
+            )
+        self._file.flush()
+        self._file.close()
+        self._file = None
         self._active = False
 
     def log_point(self, data: GPSData) -> None:
@@ -183,7 +182,7 @@ class GPSLogger:
 
         if self._file_format == "gpx":
             self._write_gpx_point(data)
-        elif self._file_format == "csv":
+        else:  # csv
             self._write_csv_point(data)
         self._count += 1
         self._file.flush()

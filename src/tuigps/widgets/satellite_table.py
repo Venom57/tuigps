@@ -13,6 +13,14 @@ from ..constants import GNSS_COLORS, GNSS_NAMES, GNSS_SHORT
 from ..data_model import GPSData
 
 
+# gpsd SKY satellite "health": (label, color)
+HEALTH: dict[int, tuple[str, str]] = {
+    0: ("---", "bright_black"),
+    1: ("OK", "green"),
+    2: ("BAD", "red"),
+}
+
+
 class SatelliteTable(Static):
     """Displays detailed satellite information in a table format."""
 
@@ -100,9 +108,8 @@ class SatelliteTable(Static):
             # Signal ID
             txt.append(f" {sat.sigid:>4}", style="bright_black")
 
-            # Health
-            health_str = "OK" if sat.health == 0 else f"{sat.health}"
-            health_color = "green" if sat.health == 0 else "red"
+            # Health (gpsd: 0 = unknown/not reported, 1 = OK, 2 = unhealthy)
+            health_str, health_color = HEALTH.get(sat.health, (str(sat.health), "red"))
             txt.append(f" {health_str:>5}", style=health_color)
 
             txt.append("\n")

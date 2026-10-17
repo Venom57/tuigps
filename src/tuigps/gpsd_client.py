@@ -396,9 +396,7 @@ class GPSDClient:
         except ValueError:
             log.debug("ignoring malformed gpsd JSON: %.80r", line)
             return
-        if not isinstance(msg, dict):
-            log.debug("ignoring non-object gpsd JSON: %.80r", line)
-            return
+        # A line starting with "{" that decodes is always a JSON object (dict)
         try:
             error = self._process_message(msg, received)
         except Exception:

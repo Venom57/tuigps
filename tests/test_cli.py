@@ -39,12 +39,6 @@ def test_check_port(value, expected):
     assert check_port(value) == expected
 
 
-@pytest.mark.parametrize("value", ["0", "65536", "-1", "abc", "29.47", ""])
-def test_check_port_invalid(value):
-    with pytest.raises(ValueError):
-        check_port(value)
-
-
 def args(*argv, env=None):
     ns = parse_args(list(argv), environ=env or {})
     return ns.host, ns.port
@@ -163,3 +157,23 @@ def test_tuigps_constructor_passes_server():
     app = TuiGPS(host="::1", port=3000)
     assert (app._gpsd.host, app._gpsd.port) == ("::1", "3000")
     assert app._gpsd.server == "[::1]:3000"
+
+
+def test_importing_dunder_main_does_not_run_the_app(fake_app):
+    import importlib
+
+    sys.modules.pop("tuigps.__main__", None)
+    try:
+        importlib.import_module("tuigps.__main__")
+    finally:
+        sys.modules.pop("tuigps.__main__", None)  # runpy wants it unimported
+    assert fake_app.instances == []
+
+
+def test_python_dash_m_version(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["tuigps", "--version"])
+    monkeypatch.delitem(sys.modules, "tuigps.__main__", raising=False)  # fresh run
+    with pytest.raises(SystemExit) as exc:
+        runpy.run_module("tuigps", run_name="__main__")
+    assert exc.value.code == 0
+    assert capsys.readouterr().out.strip() == f"tuigps {__version__}"

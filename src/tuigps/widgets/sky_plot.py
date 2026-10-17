@@ -49,13 +49,12 @@ class _Background:
         buf = [[" "] * w for _ in range(h)]
         keys = [[DEFAULT_KEY] * w for _ in range(h)]
 
-        # Concentric elevation rings at 0, 30, 60 degrees
+        # Concentric elevation rings at 0, 30, 60 degrees (max_rx >= 8 and
+        # max_ry >= 4, so even the 60 degree ring has rx, ry >= 1)
         for elev_deg in (0, 30, 60):
             r_frac = (90 - elev_deg) / 90.0
             rx = int(r_frac * max_rx)
             ry = int(r_frac * max_ry)
-            if rx < 1 or ry < 1:
-                continue
             # Sample points around the ring
             for angle_deg in range(0, 360, 2):
                 rad = math.radians(angle_deg)

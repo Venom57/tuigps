@@ -88,7 +88,8 @@ def sample_satellites():
     from tuigps.data_model import SatelliteInfo
 
     return [
-        SatelliteInfo(prn=5, gnssid=0, svid=5, elevation=65.0, azimuth=45.0, snr=42.0, used=True),
+        SatelliteInfo(prn=5, gnssid=0, svid=5, elevation=65.0, azimuth=45.0, snr=42.0, used=True,
+                      health=1),
         SatelliteInfo(prn=12, gnssid=0, svid=12, elevation=30.0, azimuth=180.0, snr=35.0, used=True),
         SatelliteInfo(prn=25, gnssid=0, svid=25, elevation=10.0, azimuth=300.0, snr=18.0, used=False),
         SatelliteInfo(prn=211, gnssid=2, svid=11, elevation=50.0, azimuth=90.0, snr=38.0, used=True),

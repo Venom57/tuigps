@@ -94,7 +94,9 @@ def test_unreadable_file_gives_defaults(config_file):
 def test_non_utf8_file_gives_defaults(config_file):
     config_file.parent.mkdir(parents=True)
     config_file.write_bytes(b'{"units": "\xff"}')
-    assert load().load_warnings
+    cfg = load()
+    assert cfg == Config()
+    assert "cannot read" in cfg.load_warnings[0]
 
 
 def test_invalid_fields_fall_back_individually(config_file):
@@ -172,6 +174,16 @@ def test_save_is_atomic(tmp_path, monkeypatch):
     assert [p.name for p in tmp_path.iterdir()] == ["config.json"]
 
 
+def test_save_reports_the_write_error_when_cleanup_fails_too(tmp_path, monkeypatch):
+    def fail(*args):
+        raise OSError("disk full" if len(args) == 2 else "cleanup failed")
+
+    monkeypatch.setattr(config_mod.os, "replace", fail)
+    monkeypatch.setattr(config_mod.os, "unlink", fail)
+    with pytest.raises(OSError, match="disk full"):
+        save(Config(), tmp_path / "config.json")
+
+
 def test_save_replaces_existing_file(tmp_path):
     path = tmp_path / "config.json"
     save(Config(units="imperial"), path)
@@ -201,7 +213,7 @@ def test_check_host_invalid(value):
         check_host(value)
 
 
-@pytest.mark.parametrize("value", [True, "1.5", "0"])
+@pytest.mark.parametrize("value", ["0", "65536", "-1", "abc", "29.47", "1.5", "", True])
 def test_check_port_invalid(value):
     with pytest.raises(ValueError):
         check_port(value)

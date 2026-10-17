@@ -802,16 +802,16 @@ def test_callback_exceptions_do_not_drop_connection(fake_gpsd, running, caplog):
 def test_error_callback_exception_is_contained(running, refused_port, fast_retry):
     c = running("127.0.0.1", refused_port)
     calls = []
+    rec = Recorder()
 
     def on_error(msg):
         calls.append(msg)
         raise RuntimeError("notify failed")
 
-    c.start(on_error=on_error)
-    deadline = _real_time.monotonic() + 2
-    while not calls and _real_time.monotonic() < deadline:
-        _real_time.sleep(0.01)
-    assert calls and c._thread.is_alive()
+    c.start(on_update=rec.on_update, on_error=on_error)
+    # The loop keeps retrying after the failing error callback
+    assert rec.wait(lambda: rec.updates and rec.last.reconnect_attempts >= 3)
+    assert len(calls) == 1 and c._thread.is_alive()
 
 
 def test_stopped_run_errors_are_not_reported(running):
@@ -916,7 +916,204 @@ def test_backoff_grows_when_connections_deliver_nothing(running, monkeypatch):
         c.stop()
         assert [u.retry_delay for u in down()][:4] == [0.01, 0.02, 0.04, 0.04]
         # connected -> disconnected is reported each time it happens
-        assert all(e == "gpsd disconnected" for e in rec.errors)
+        assert rec.errors and all(e == "gpsd disconnected" for e in rec.errors)
     finally:
         stop_dropping.set()
         server.close()
+
+
+# ─── Reader thread edge cases (scripted sockets, no network) ───────────
+
+
+class ScriptedSocket:
+    """A connected socket stand-in: recv() plays back ``steps`` in order.
+
+    A step is bytes (returned), an exception (raised) or a callable (called;
+    its return value is returned).
+    """
+
+    def __init__(self, *steps):
+        self.steps = list(steps)
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    def recv(self, n):
+        step = self.steps.pop(0)
+        if isinstance(step, BaseException):
+            raise step
+        return step() if callable(step) else step
+
+    def sendall(self, data):
+        self.sent.append(data)
+
+    def shutdown(self, how):
+        pass
+
+    def close(self):
+        self.closed = True
+
+
+def test_read_loop_survives_idle_timeouts(client):
+    """recv() timing out on an idle connection is not a disconnect."""
+    import socket
+
+    sock = ScriptedSocket(socket.timeout(), TimeoutError(), jline(json.loads(TPV_325)), b"")
+    with pytest.raises(ConnectionError, match="gpsd disconnected"):
+        client._read_loop(sock, threading.Event())
+    assert client.data.tpv_seq == 1  # the TPV after the timeouts was processed
+    assert sock.steps == []
+
+
+def test_read_loop_discards_data_received_after_stop(client):
+    stop = threading.Event()
+
+    def stop_then_data():
+        stop.set()
+        return jline(json.loads(TPV_325))
+
+    client._read_loop(ScriptedSocket(stop_then_data), stop)
+    assert client.data.tpv_seq == 0
+
+
+def test_read_loop_stops_in_the_middle_of_a_chunk(client):
+    """stop() from a callback ends processing before the next line of the chunk."""
+    stop = threading.Event()
+    client._on_update = lambda data: stop.set()
+    chunk = jline(json.loads(TPV_325)) * 2
+    client._read_loop(ScriptedSocket(chunk), stop)
+    assert client.data.tpv_seq == 1
+
+
+def test_read_loop_exits_when_stopped_while_idle(client):
+    stop = threading.Event()
+
+    def stop_and_time_out():
+        stop.set()
+        raise TimeoutError()
+
+    sock = ScriptedSocket(stop_and_time_out)
+    client._read_loop(sock, stop)  # returns instead of raising or looping
+    assert sock.steps == []
+
+
+def test_run_that_is_already_stopped_never_connects(client, monkeypatch):
+    monkeypatch.setattr(client, "_open_socket", lambda stop: pytest.fail("connected"))
+    updates = []
+    client._on_update = updates.append
+    stop = threading.Event()
+    stop.set()
+    client._run(stop)
+    assert updates == []
+
+
+def test_stop_during_connect_sends_no_watch(client):
+    """stop() racing a successful connect: no ?WATCH, socket closed, no error."""
+    sock = ScriptedSocket()
+    errors = []
+    client._on_error = errors.append
+
+    def connect_then_stop(stop):
+        stop.set()
+        return sock
+
+    client._open_socket = connect_then_stop
+    client._run(threading.Event())
+    assert sock.sent == [] and sock.closed
+    assert client._sock is None
+    assert client.data.connection_state == "connecting" and errors == []
+
+
+def _addrinfo(*ports):
+    import socket
+
+    return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", p)) for p in ports]
+
+
+def test_open_socket_falls_back_to_the_next_address(fake_gpsd, refused_port, monkeypatch):
+    """The first address failing at once (e.g. IPv6 refused) tries the next one."""
+    import socket
+
+    real_connect_ex = socket.socket.connect_ex
+    monkeypatch.setattr(gpsd_client.socket, "getaddrinfo",
+                        lambda *a, **k: _addrinfo(refused_port, fake_gpsd.port))
+    monkeypatch.setattr(
+        gpsd_client.socket.socket, "connect_ex",
+        lambda self, addr: errno.ECONNREFUSED if addr[1] == refused_port
+        else real_connect_ex(self, addr),
+    )
+    c = GPSDClient("localhost", 2947)
+    sock = c._open_socket(threading.Event())
+    try:
+        assert sock.getpeername()[1] == fake_gpsd.port
+        assert sock.gettimeout() == c.POLL_TIMEOUT
+    finally:
+        sock.close()
+
+
+def test_open_socket_handles_an_immediate_connect(fake_gpsd, monkeypatch):
+    """connect_ex() may complete at once (returns 0) instead of EINPROGRESS."""
+    import socket
+
+    real_connect_ex = socket.socket.connect_ex
+
+    def blocking_connect_ex(self, addr):
+        self.setblocking(True)
+        try:
+            return real_connect_ex(self, addr)
+        finally:
+            self.setblocking(False)
+
+    monkeypatch.setattr(gpsd_client.socket.socket, "connect_ex", blocking_connect_ex)
+    monkeypatch.setattr(gpsd_client.select, "select",
+                        lambda *a: pytest.fail("select() is not needed"))
+    sock = GPSDClient("127.0.0.1", fake_gpsd.port)._open_socket(threading.Event())
+    try:
+        assert sock.getpeername()[1] == fake_gpsd.port
+    finally:
+        sock.close()
+
+
+def test_host_without_addresses_is_reported(running, monkeypatch):
+    monkeypatch.setattr(gpsd_client.socket, "getaddrinfo", lambda *a, **k: [])
+    c = running("gpsbox", 2947)
+    rec = Recorder()
+    rec.start(c)
+    assert rec.wait(lambda: rec.errors)
+    assert rec.errors[0] == "no address for gpsbox (gpsbox:2947)"
+
+
+def test_close_socket_ignores_errors(caplog):
+    class Broken:
+        def shutdown(self, how):
+            raise OSError(errno.ENOTCONN, "not connected")
+
+        def close(self):
+            raise OSError(errno.EBADF, "bad fd")
+
+    caplog.set_level("DEBUG", logger="tuigps.gpsd_client")
+    GPSDClient._close_socket(Broken())  # must not raise
+    assert "closing gpsd socket failed" in caplog.text
+
+
+def test_stop_is_bounded_when_the_thread_hangs(client, caplog):
+    release = threading.Event()
+    hung = threading.Thread(target=release.wait, daemon=True)
+    hung.start()
+    client._thread = hung
+    try:
+        t0 = _real_time.monotonic()
+        client.stop(timeout=0.05)
+        assert _real_time.monotonic() - t0 < 1.0
+        assert "did not exit within the stop timeout" in caplog.text
+    finally:
+        release.set()
+        hung.join(1.0)
+
+
+def test_running_flag_does_not_replace_a_live_stop_event(client):
+    client._running = True
+    event = client._stop_event
+    client._running = True  # already running: same run, same event
+    assert client._stop_event is event and client._running
+    client._running = False
+    assert event.is_set() and not client._running

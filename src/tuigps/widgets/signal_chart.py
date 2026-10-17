@@ -66,9 +66,7 @@ class SignalChart(Static):
 
         for i, sat in enumerate(sats):
             if i >= height_budget:
-                remaining = len(sats) - i
-                if remaining > 0:
-                    txt.append(f"  ... +{remaining} more\n", style="dim")
+                txt.append(f"  ... +{len(sats) - i} more\n", style="dim")
                 break
 
             prefix = GNSS_SHORT.get(sat.gnssid, "??")

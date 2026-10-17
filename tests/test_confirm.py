@@ -186,8 +186,8 @@ async def test_pps_sync_confirmation(monkeypatch, make_gps_data):
         await press(pilot, w, "btn-pps-sync")
         app.screen.query_one("#confirm-yes", Button).press()
         assert await wait_for(pilot, lambda: NTP_DISABLED_HINT in log_text(w))
+    # Confirming runs the sync (its commands: test_device_config_ui.py)
     assert calls[0] == NTP_OFF
-    assert calls[1][-4:] == ["xbb", "-2000", "true", "true"]
 
 
 async def test_arm_clock_sync_confirmation_only_when_arming():
@@ -204,11 +204,16 @@ async def test_arm_clock_sync_confirmation_only_when_arming():
         await press(pilot, w, "btn-arm-clock")
         app.screen.query_one("#confirm-yes", Button).press()
         await pilot.pause()
+        btn = w.query_one("#btn-arm-clock", Button)
         assert app._armed_clock_set is True
+        assert btn.variant == "success" and str(btn.label) == "ARMED (click to cancel)"
+        assert "Clock sync ARMED" in log_text(w)
 
         await press(pilot, w, "btn-arm-clock")  # disarming: no dialog
         assert not isinstance(app.screen, ConfirmScreen)
         assert app._armed_clock_set is False
+        assert btn.variant == "warning" and str(btn.label) == "Arm Clock Sync"
+        assert "Clock sync disarmed" in log_text(w)
 
 
 async def test_clock_checks_run_before_the_dialog(monkeypatch, make_gps_data):

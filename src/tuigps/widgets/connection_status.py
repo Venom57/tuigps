@@ -168,17 +168,20 @@ class ConnectionStatus(Static):
         # Constellation breakdown (e.g., "4GP+2GA")
         counts = d.constellation_counts if sats else {}
         if counts:
-            parts = []
-            for gnssid, (visible, used) in sorted(counts.items()):
-                if used > 0:
-                    short = GNSS_SHORT.get(gnssid, "??")
-                    parts.append(f"{used}{short}")
+            parts = [
+                f"{used}{GNSS_SHORT.get(gnssid, '??')}"
+                for gnssid, (_visible, used) in sorted(counts.items())
+                if used > 0
+            ]
             if parts:
                 txt.append("+".join(parts), style="green bold")
-                txt.append(f"/{len(d.satellites)}sv ", style="white")
-        elif sats and d.satellites_used > 0:
-            txt.append(f"{d.satellites_used}", style="green bold")
+            else:
+                txt.append("0", style="yellow bold")  # satellites in view, none used yet
             txt.append(f"/{len(d.satellites)}sv ", style="white")
+        elif sats and d.satellites_used > 0:
+            # No satellite list (e.g. only the GGA "satellites used" count)
+            txt.append(f"{d.satellites_used}", style="green bold")
+            txt.append(" used ", style="white")
 
         if device and d.device.path:
             txt.append(f"{d.device.path} ", style="dim")

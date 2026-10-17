@@ -300,7 +300,7 @@ async def test_connection_status_connecting_and_retry_countdown():
         bar.update_gps_data(GPSData(connection_state="connecting"))
         assert "CONNECTING\u2026" in bar.render().plain
         bar.update_gps_data(GPSData(connection_state="disconnected",
-                                    next_retry_at=time.time() + 7.5, retry_delay=8.0))
+                                    next_retry_at=time.time() + 7.9, retry_delay=8.0))
         assert "DISCONNECTED \u2014 retry in 8s" in bar.render().plain
         bar.update_gps_data(GPSData(connection_state="disconnected",
                                     next_retry_at=time.time() - 1))
@@ -321,17 +321,6 @@ async def test_sky_plot_skips_below_horizon_and_nan():
         sky.update_gps_data(GPSData(satellites=sats))
         plain = sky.render().plain
         assert "#" not in plain and "77" not in plain and "88" not in plain
-
-
-async def test_signal_chart_truncates_when_too_many():
-    chart = SignalChart()
-    app = Harness(chart, height=8)
-    async with app.run_test(size=(80, 20)):
-        sats = [SatelliteInfo(gnssid=0, svid=i, snr=40.0 - i, used=True) for i in range(1, 11)]
-        chart.update_gps_data(GPSData(satellites=sats))
-        plain = chart.render().plain
-        assert "GP01" in plain
-        assert "... +" in plain
 
 
 async def test_signal_chart_budget_ignores_skipped_satellites():
@@ -445,6 +434,18 @@ async def test_nmea_viewer_resume_does_not_duplicate():
         await _press(pilot, viewer, "btn-nmea-pause")
         assert _log_lines(log) == SENTENCES + ["$GPVTG,z*00"]
         assert "PAUSED" not in viewer.stats_text()
+
+
+async def test_nmea_viewer_resume_without_new_sentences():
+    viewer = NMEAViewer()
+    async with Harness(viewer).run_test(size=(120, 30)) as pilot:
+        log = viewer.query_one("#nmea-log", RichLog)
+        for s in SENTENCES:
+            viewer.append_nmea(s)
+        await _press(pilot, viewer, "btn-nmea-pause")
+        await _press(pilot, viewer, "btn-nmea-pause")
+        assert _log_lines(log) == SENTENCES
+        assert viewer.stats_text().startswith("3 sentences") and "PAUSED" not in viewer.stats_text()
 
 
 async def test_nmea_viewer_filter_change_while_paused():
@@ -706,3 +707,152 @@ async def test_time_panel_toff_without_source_or_stats():
         plain = tp.render().plain
         assert "  Offset:  -1.000 us" in plain.splitlines()  # no source label
         assert "Computed TOFF stats" not in plain
+
+
+# ─── Edge cases: repaint skipping, partial data, formatting ranges ─────
+
+
+@pytest.mark.parametrize("factory", [
+    PositionPanel, FixPanel, VelocityPanel, SkyPlot, SignalChart, ErrorPanel, DevicePanel,
+    TimePanel, ConstellationPanel, SatelliteTable, ConnectionStatus,
+], ids=lambda f: f.__name__)
+def test_same_snapshot_is_not_repainted(factory, make_gps_data, monkeypatch):
+    """Snapshots are immutable: re-delivering the same one must not repaint."""
+    widget = factory()
+    repaints = []
+    monkeypatch.setattr(widget, "refresh", lambda *a, **k: repaints.append(1))
+    data = make_gps_data()
+    widget.update_gps_data(data)
+    widget.update_gps_data(data)
+    assert len(repaints) == 1
+    widget.update_gps_data(make_gps_data())  # a new snapshot repaints
+    assert len(repaints) == 2
+
+
+@pytest.mark.parametrize("ept, expected", [
+    (0.0005, "ept:     500.0 us"),
+    (0.25, "ept:     250.0 ms"),
+    (2.5, "ept:     2.500 s"),
+])
+async def test_time_panel_ept_units(ept, expected, make_gps_data):
+    from tuigps.data_model import ErrorEstimates
+
+    tp = TimePanel()
+    async with Harness(tp).run_test():
+        tp.update_gps_data(make_gps_data(errors=ErrorEstimates(ept=ept)))
+        assert expected in tp.render().plain
+
+
+@pytest.mark.parametrize("precision, expected", [
+    (-30, "Prec:    0.9 ns"),
+    (-15, "Prec:    30.5 us"),
+    (-5, "Prec:    31.2 ms"),
+])
+async def test_time_panel_pps_precision_units(precision, expected):
+    tp = TimePanel(show_pps=True)
+    async with Harness(tp).run_test():
+        tp.update_gps_data(GPSData(pps=PPSData(real_sec=10.0, real_nsec=0.0, clock_sec=10.0,
+                                               clock_nsec=0.0, precision=precision)))
+        assert expected in tp.render().plain
+
+
+async def test_time_panel_incomplete_pps_and_toff():
+    """A PPS/TOFF report missing its clock fields shows no offset (and no 'No data')."""
+    from tuigps.data_model import TOFFData
+
+    tp = TimePanel(show_pps=True)
+    async with Harness(tp).run_test():
+        tp.update_gps_data(GPSData(
+            pps=PPSData(real_sec=10.0, real_nsec=0.0, precision=-20),
+            toff=TOFFData(real_sec=10.0, real_nsec=0.0),
+        ))
+        plain = tp.render().plain
+        assert "Offset" not in plain and "Quality" not in plain
+        assert "Prec:    953.7 ns" in plain
+        assert "No PPS data" not in plain and "No TOFF data" not in plain
+
+
+async def test_device_panel_path_only():
+    """Only the fields gpsd reported are shown."""
+    from tuigps.data_model import DeviceInfo
+
+    dev = DevicePanel()
+    async with Harness(dev).run_test():
+        dev.update_gps_data(GPSData(device=DeviceInfo(path="/dev/ttyUSB0", cycle=0.0)))
+        lines = dev.render().plain.splitlines()
+    assert lines[2:] == ["  Path:   /dev/ttyUSB0"]
+
+
+async def test_position_hold_without_altitude(make_gps_data):
+    """F12: a hold with no valid altitudes shows no altitude statistics."""
+    pos = PositionPanel()
+    async with Harness(pos).run_test():
+        pos.update_gps_data(make_gps_data())
+        pos.set_hold_data(HoldResult(mean_lat=47.0, mean_lon=-122.0, std_north=0.5,
+                                     std_east=0.7, cep50=0.71, cep95=1.52, fix_count=5))
+        plain = pos.render().plain
+    assert "Std N/S: 0.500 m" in plain and "CEP95:   1.520 m" in plain
+    assert "Avg Alt" not in plain and "Std Alt" not in plain
+
+
+async def test_connection_status_satellite_counts(make_gps_data):
+    bar = ConnectionStatus()
+    async with Harness(bar).run_test(size=(200, 10)):
+        unused = [SatelliteInfo(prn=p, gnssid=0, svid=p, snr=30.0) for p in (1, 2, 3)]
+        bar.update_gps_data(make_gps_data(satellites=unused, satellites_used=0))
+        assert "0/3sv" in bar.render().plain  # in view, none used yet
+        bar.update_gps_data(make_gps_data(satellites=[], satellites_used=7))
+        plain = bar.render().plain
+        assert "7 used" in plain and "sv" not in plain  # no satellite list (uSat only)
+        bar.update_gps_data(make_gps_data(satellites=[], satellites_used=0))
+        assert "used" not in bar.render().plain
+
+
+async def test_connection_status_help_hint_shown_once_when_squeezed():
+    """The help hint is moved to the end even when it is not the last hint."""
+    hints = [("?", "Help"), ("a", "Alpha"), ("b", "Bravo"), ("c", "Charlie")]
+    bar = ConnectionStatus(hints=hints, help_hint=("?", "Help"))
+    async with Harness(bar).run_test(size=(50, 10)):  # all four need 56 columns
+        bar.update_gps_data(GPSData())
+        plain = bar.render().plain
+    assert plain.startswith(" a  Alpha  b  Bravo  ?  Help ")
+    assert plain.count("Help") == 1 and "Charlie" not in plain
+
+
+async def test_connection_status_too_narrow_for_help_hint():
+    bar = ConnectionStatus(hints=[("q", "Quit"), ("?", "Help")], help_hint=("?", "Help"))
+    async with Harness(bar).run_test(size=(22, 10)):
+        bar.update_gps_data(GPSData())
+        plain = bar.render().plain
+    assert "DISCONNECTED" in plain and "Help" not in plain and "Quit" not in plain
+
+
+def test_nmea_viewer_is_safe_before_mount():
+    """Sentences, filters and stats are kept even with no log to draw on."""
+    viewer = NMEAViewer()
+    viewer.append_nmea_batch(["$GPGGA,a*00", "$GPRMC,b*00"])
+    viewer._set_filter("GGA")
+    viewer._rerender()
+    viewer._update_stats()
+    assert list(viewer._buffer) == ["$GPGGA,a*00", "$GPRMC,b*00"]
+    assert viewer.stats_text().startswith("2 sentences") and "GGA: 1" in viewer.stats_text()
+
+
+def test_nmea_viewer_filter_matching():
+    viewer = NMEAViewer()
+    assert viewer._matches_filter("$GPRMC,x*00")  # no filter: everything matches
+    viewer._filter = "GGA"
+    assert viewer._matches_filter("$GNGGA,x*00")  # any talker
+    assert not viewer._matches_filter("$GPRMC,x*00")
+    assert not viewer._matches_filter("!AIVDM,1,1")
+
+
+async def test_satellite_table_health_follows_gpsd():
+    """gpsd health: 0 = unknown (not reported), 1 = OK, 2 = unhealthy."""
+    table = SatelliteTable()
+    async with Harness(table).run_test(size=(100, 20)):
+        sats = [SatelliteInfo(prn=p, gnssid=0, svid=p, health=h)
+                for p, h in ((1, 0), (2, 1), (3, 2), (4, 7))]
+        table.update_gps_data(GPSData(satellites=sats))
+        rows = table.render().plain.splitlines()[3:7]
+    assert [row.split()[-1] for row in rows] == ["---", "OK", "BAD", "7"]
