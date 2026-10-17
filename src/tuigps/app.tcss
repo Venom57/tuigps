@@ -22,58 +22,60 @@ TabPane {
     height: 1fr;
 }
 
+/* Responsive grid: the app sets one of -wide (3 columns, >= 120 cells),
+   -medium (2 columns, >= 80) or -narrow (1 column) on resize, and reorders
+   the panels for -medium (see TuiGPS._layout_dashboard). Text panels size
+   their rows to their content; the sky plot row takes the remaining height
+   (at least the min-height allows; otherwise the dashboard scrolls). */
 #dashboard-grid {
     layout: grid;
-    grid-size: 3 3;
+    grid-size: 3;
     grid-columns: 1fr 1fr 1fr;
-    grid-rows: 3fr 4fr 3fr;
+    grid-rows: auto 1fr auto;
     grid-gutter: 0 1;
-    min-height: 30;
-    height: auto;
+    height: 1fr;
+    min-height: 41;  /* rows 1 and 3 (~25) + a 14-line sky plot (16 with border) */
     padding: 0 1;
 }
 
-/* Row 1: info panels */
-PositionPanel {
-    column-span: 1;
+#dashboard-grid > * {
+    height: 100%;  /* fill the row: panels in a row line up */
     border: solid $accent;
 }
 
-FixPanel {
-    column-span: 1;
-    border: solid $accent;
-}
-
-VelocityPanel {
-    column-span: 1;
-    border: solid $accent;
-}
-
-/* Row 2: sky plot + signal chart */
-SkyPlot {
+#dashboard-grid > SkyPlot {
     column-span: 2;
     border: heavy $accent;
 }
 
-SignalChart {
-    column-span: 1;
-    border: solid $accent;
+#dashboard-grid.-medium {
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    grid-rows: auto auto 1fr auto;
+    min-height: 51;  /* three text rows (~35) + a 14-line sky plot (16 with border) */
 }
 
-/* Row 3: bottom panels */
-ErrorPanel {
+#dashboard-grid.-medium > SkyPlot {
     column-span: 1;
-    border: solid $accent;
 }
 
-DevicePanel {
-    column-span: 1;
-    border: solid $accent;
+#dashboard-grid.-narrow {
+    grid-size: 1;
+    grid-columns: 1fr;
+    grid-rows: auto;
+    height: auto;
+    min-height: 0;
 }
 
-TimePanel {
+#dashboard-grid.-narrow > SkyPlot {
     column-span: 1;
-    border: solid $accent;
+    min-height: 18;
+    max-height: 18;
+}
+
+#dashboard-grid.-narrow > SignalChart {
+    min-height: 14;
+    max-height: 14;
 }
 
 

@@ -103,3 +103,13 @@ def fmt_time_iso(iso_str: str) -> tuple[str, str]:
     if len(parts) == 2:
         return parts[0], parts[1]
     return parts[0], "---"
+
+
+def trim(txt):
+    """Strip trailing whitespace (newlines) from a rich Text, in place, and return it.
+
+    Panels build their text line by line ending in "\\n"; without trimming,
+    the last newline adds a blank line to the panel's content height.
+    """
+    txt.rstrip()
+    return txt

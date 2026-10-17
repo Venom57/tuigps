@@ -121,13 +121,16 @@ def test_status_hints_come_from_bindings():
 
 @pytest.mark.parametrize("width", [40, 80, 120, 200])
 @pytest.mark.parametrize("badges", [False, True])
-async def test_status_bar_fits_and_keeps_status(width, badges, make_gps_data):
+async def test_status_bar_fits_and_keeps_status(width, badges, make_gps_data, monkeypatch):
+    # No heartbeat refresh: it would reset the badges set below from the app state
+    monkeypatch.setattr(TuiGPS, "_heartbeat", lambda self: None)
     app = TuiGPS()
     async with app.run_test(size=(width, 24)) as pilot:
         bar = app.query_one("#w-connection", ConnectionStatus)
         bar.logging_active, bar.log_count = badges, 12
         bar.hold_active, bar.hold_count = badges, 3
-        bar.update_gps_data(make_gps_data())
+        app._gps_data = make_gps_data()
+        bar.update_gps_data(app._gps_data)
         await pilot.pause()
         assert bar.size.width == width
         text = bar.render()

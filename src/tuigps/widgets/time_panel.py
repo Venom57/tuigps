@@ -8,7 +8,7 @@ from rich.text import Text
 from textual.widgets import Static
 
 from ..data_model import GPSData
-from ..formatting import fmt, fmt_time_iso
+from ..formatting import fmt, fmt_time_iso, trim
 
 
 # Labels for GPSData.toff_source
@@ -55,7 +55,7 @@ class TimePanel(Static):
 
         if not self._data:
             txt.append("  No data\n", style="dim")
-            return txt
+            return trim(txt)
 
         d = self._data
 
@@ -82,7 +82,7 @@ class TimePanel(Static):
             txt.append(f"{d.leapseconds} s\n")
 
         if not self.show_pps:
-            return txt
+            return trim(txt)
 
         # ── PPS section (timing tab only) ──
         pps = d.pps
@@ -193,4 +193,4 @@ class TimePanel(Static):
             txt.append("  TDOP:    ", style="bright_black")
             txt.append(f"{d.dop.tdop:.1f}\n")
 
-        return txt
+        return trim(txt)

@@ -9,7 +9,7 @@ from textual.widgets import Static
 
 from ..constants import MODE_COLORS, MODE_NAMES, STATUS_COLORS, STATUS_NAMES, dop_rating
 from ..data_model import GPSData
-from ..formatting import fmt
+from ..formatting import fmt, trim
 
 
 class FixPanel(Static):
@@ -47,7 +47,7 @@ class FixPanel(Static):
 
         if not self._data:
             txt.append("  No data\n", style="dim")
-            return txt
+            return trim(txt)
 
         d = self._data
 
@@ -84,4 +84,4 @@ class FixPanel(Static):
             txt.append(f"  {label}:   ", style="bright_black")
             txt.append(f"{val_str}\n", style=color)
 
-        return txt
+        return trim(txt)

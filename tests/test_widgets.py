@@ -704,5 +704,5 @@ async def test_time_panel_toff_without_source_or_stats():
         tp.update_gps_data(GPSData(toff=TOFFData(real_sec=10.0, real_nsec=0.0, clock_sec=10.0,
                                                  clock_nsec=1000.0)))
         plain = tp.render().plain
-        assert "Offset:  -1.000 us\n" in plain  # no source label
+        assert "  Offset:  -1.000 us" in plain.splitlines()  # no source label
         assert "Computed TOFF stats" not in plain

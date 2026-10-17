@@ -9,6 +9,7 @@ from textual.widgets import Static
 
 from ..constants import GNSS_COLORS, GNSS_NAMES
 from ..data_model import GPSData
+from ..formatting import trim
 
 
 class ConstellationPanel(Static):
@@ -43,7 +44,7 @@ class ConstellationPanel(Static):
 
         if not self._data or not self._data.satellites:
             txt.append("  No satellites in view\n", style="dim")
-            return txt
+            return trim(txt)
 
         counts = self._data.constellation_counts
         total_vis = 0
@@ -82,4 +83,4 @@ class ConstellationPanel(Static):
         txt.append(f"{total_vis}", style="white")
         txt.append(f" visible\n", style="white")
 
-        return txt
+        return trim(txt)

@@ -9,7 +9,7 @@ from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..data_model import GPSData
-from ..formatting import fmt, fmt_climb, fmt_distance, fmt_speed
+from ..formatting import fmt, fmt_climb, fmt_distance, fmt_speed, trim
 
 
 class ErrorPanel(Static):
@@ -43,7 +43,7 @@ class ErrorPanel(Static):
 
         if not self._data:
             txt.append("  No data\n", style="dim")
-            return txt
+            return trim(txt)
 
         e = self._data.errors
         u = self.units
@@ -69,4 +69,4 @@ class ErrorPanel(Static):
             else:
                 txt.append(f"{val}\n", style="bright_black")
 
-        return txt
+        return trim(txt)

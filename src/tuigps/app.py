@@ -10,6 +10,7 @@ import webbrowser
 from collections import deque
 from contextlib import contextmanager
 
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
@@ -60,6 +61,20 @@ TAB_WIDGETS: dict[str, tuple[str, ...]] = {
     "tab-timing": ("w-time-detail", "w-device-detail"),
     "tab-device": (),  # DeviceConfig is always updated (see _refresh_ui)
     "tab-nmea": (),  # NMEA is delivered in batches (see _drain_nmea)
+}
+
+# Responsive dashboard: (minimum width, layout class) from widest to narrowest,
+# and the panel order of each layout (grid cells are filled in DOM order).
+DASHBOARD_LAYOUTS: tuple[tuple[int, str], ...] = ((120, "-wide"), (80, "-medium"), (0, "-narrow"))
+_DASHBOARD_ORDER = (
+    "w-position", "w-fix", "w-velocity", "w-skyplot", "w-signal", "w-errors", "w-device", "w-time",
+)
+DASHBOARD_ORDER: dict[str, tuple[str, ...]] = {
+    "-wide": _DASHBOARD_ORDER,  # [pos fix vel] [sky sky signal] [errors device time]
+    # [pos fix] [vel errors] [sky signal] [device time]
+    "-medium": ("w-position", "w-fix", "w-velocity", "w-errors",
+                "w-skyplot", "w-signal", "w-device", "w-time"),
+    "-narrow": _DASHBOARD_ORDER,
 }
 
 # Tabs in display order: (pane id, title, description for the help screen).
@@ -157,6 +172,7 @@ class TuiGPS(App):
         self._device_config: DeviceConfig | None = None
         self._nmea_viewer: NMEAViewer | None = None
         self._arm_toff_button: Button | None = None
+        self._dashboard_layout = ""  # current DASHBOARD_LAYOUTS class
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -232,6 +248,7 @@ class TuiGPS(App):
 
     def on_mount(self) -> None:
         self._cache_widgets()
+        self._layout_dashboard(self.size.width)
 
         # Sorted theme list; start with the configured theme
         self._theme_list = sorted(self.available_themes.keys())
@@ -253,6 +270,29 @@ class TuiGPS(App):
 
         # Heartbeat refresh (catches staleness even without gpsd updates)
         self.set_interval(1.0, self._heartbeat)
+
+    # ─── Responsive dashboard ───────────────────────────────────
+
+    def on_resize(self, event: events.Resize) -> None:
+        self._layout_dashboard(event.size.width)
+
+    def _layout_dashboard(self, width: int) -> None:
+        """Pick the dashboard layout (3, 2 or 1 columns) for the terminal width."""
+        layout = next(name for min_width, name in DASHBOARD_LAYOUTS if width >= min_width)
+        if layout == self._dashboard_layout:
+            return
+        try:
+            grid = self.query_one("#dashboard-grid", Grid)
+        except NoMatches:
+            return
+        self._dashboard_layout = layout
+        for _, name in DASHBOARD_LAYOUTS:
+            grid.set_class(name == layout, name)
+        # Reorder the panels (cells are filled in DOM order)
+        order = DASHBOARD_ORDER[layout]
+        if [child.id for child in grid.children] != list(order):
+            for wid in order:
+                grid.move_child(grid.query_one(f"#{wid}"), after=len(grid.children) - 1)
 
     # ─── Cross-thread delivery ──────────────────────────────────
 

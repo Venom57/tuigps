@@ -10,7 +10,7 @@ from textual.widgets import Static
 
 from ..constants import bearing_to_compass
 from ..data_model import GPSData
-from ..formatting import fmt_climb, fmt_speed
+from ..formatting import fmt_climb, fmt_speed, trim
 
 
 class VelocityPanel(Static):
@@ -44,7 +44,7 @@ class VelocityPanel(Static):
 
         if not self._data:
             txt.append("  No data\n", style="dim")
-            return txt
+            return trim(txt)
 
         d = self._data
 
@@ -79,4 +79,4 @@ class VelocityPanel(Static):
         else:
             txt.append("---\n")
 
-        return txt
+        return trim(txt)

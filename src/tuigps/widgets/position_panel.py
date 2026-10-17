@@ -9,7 +9,7 @@ from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..data_model import GPSData
-from ..formatting import fmt_altitude, fmt_coord, fmt_distance
+from ..formatting import fmt_altitude, fmt_coord, fmt_distance, trim
 from ..position_hold import HoldResult
 
 
@@ -54,7 +54,7 @@ class PositionPanel(Static):
 
         if not self._data:
             txt.append("  No data\n", style="dim")
-            return txt
+            return trim(txt)
 
         d = self._data
         cf = self.coord_format
@@ -116,4 +116,4 @@ class PositionPanel(Static):
                 cep95_color = "green" if h.cep95 < 5 else "yellow" if h.cep95 < 10 else "red"
                 txt.append(fmt_distance(h.cep95, u, ".3f") + "\n", style=cep95_color)
 
-        return txt
+        return trim(txt)
