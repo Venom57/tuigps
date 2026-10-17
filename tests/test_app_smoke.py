@@ -863,3 +863,166 @@ async def test_config_server_is_used_without_override(config_file):
     config_mod.save(Config(host="cfghost", port=3001))
     app = TuiGPS()
     assert (app._gpsd.host, app._gpsd.port) == ("cfghost", "3001")
+
+
+# ─── Settings validation and the constellation display filter ─────────
+
+
+async def _open_settings(pilot, app):
+    await pilot.press("s")
+    await pilot.pause()
+    assert isinstance(app.screen, SettingsScreen)
+    return app.screen
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("#input-port", "99999", "out of range"),
+        ("#input-port", "abc", "invalid port"),
+        ("#input-port", "", "invalid port"),
+        ("#input-host", "", "host is empty"),
+        ("#input-host", "my host", "must not contain spaces"),
+    ],
+)
+async def test_settings_invalid_server_shows_error_and_refuses_apply(
+    field, value, message, config_file
+):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        apply_btn = screen.query_one("#btn-apply", Button)
+        assert not apply_btn.disabled
+        assert not any(lbl.display for lbl in screen.query(".field-error"))
+        screen.query_one(field, Input).value = value
+        await pilot.pause()
+        name = "port" if "port" in field else "host"
+        error = screen.query_one(f"#error-{name}")
+        assert error.display and message in str(error.render())
+        assert apply_btn.disabled
+        # Enter in a field (or a forced apply) is refused too
+        screen.query_one(field, Input).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        screen._apply()
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+        # Fixing the value clears the error
+        screen.query_one(field, Input).value = "2948" if name == "port" else "gpsbox"
+        await pilot.pause()
+        assert not error.display and not apply_btn.disabled
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+    assert not config_file.exists()  # nothing was applied or saved
+
+
+async def test_settings_log_dir_validation(tmp_path, config_file):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        log_dir = screen.query_one("#input-log-dir", Input)
+        for bad in (str(blocker), str(blocker / "sub"), "  "):
+            log_dir.value = bad
+            await pilot.pause()
+            assert screen.query_one("#error-log-dir").display
+            assert screen.query_one("#btn-apply", Button).disabled
+        log_dir.value = str(tmp_path / "new" / "logs")  # can be created
+        await pilot.pause()
+        assert not screen.query_one("#error-log-dir").display
+        assert not screen.query_one("#btn-apply", Button).disabled
+
+
+async def test_settings_requires_a_constellation(config_file):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        for chk in screen.query("#gnss-checkboxes Checkbox"):
+            chk.value = False
+        await pilot.pause()
+        assert screen.query_one("#error-gnss").display
+        assert screen.query_one("#btn-apply", Button).disabled
+        screen.query_one("#chk-gnss-navic").value = True
+        await pilot.pause()
+        assert not screen.query_one("#btn-apply", Button).disabled
+
+
+async def test_settings_lists_all_constellations_as_display_filter():
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        label = str(screen.query_one("#gnss-label").render())
+        assert label.startswith("Show constellations")
+        keys = [c.id.removeprefix("chk-gnss-") for c in screen.query("#gnss-checkboxes Checkbox")]
+        assert keys == ["gps", "sbas", "galileo", "beidou", "imes", "qzss", "glonass", "navic"]
+        assert all(c.value for c in screen.query("#gnss-checkboxes Checkbox"))  # default: all
+
+
+async def test_settings_apply_persists_everything(tmp_path, config_file, make_gps_data):
+    log_dir = tmp_path / "logs"
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app._gps_data = make_gps_data()
+        screen = await _open_settings(pilot, app)
+        screen.query_one("#select-units", Select).value = "imperial"
+        screen.query_one("#select-coord", Select).value = "dms"
+        screen.query_one("#select-log-format", Select).value = "csv"
+        screen.query_one("#input-log-dir", Input).value = str(log_dir)
+        screen.query_one("#chk-gnss-galileo").value = False
+        screen.query_one("#chk-gnss-glonass").value = False
+        port = screen.query_one("#input-port", Input)
+        port.value = " 2948 "
+        port.focus()
+        await pilot.press("enter")  # Enter in an Input applies
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+        assert app._gpsd.port == "2948"
+        assert app._hidden_gnss == frozenset({2, 6})
+        # The filter takes effect immediately on the visible widgets
+        assert "GA11" not in app.query_one("#w-signal").render().plain
+    saved = config_mod.load()
+    assert (saved.units, saved.coord_format) == ("imperial", "dms")
+    assert (saved.log_format, saved.log_dir) == ("csv", str(log_dir))
+    assert saved.display_gnss == ["gps", "sbas", "beidou", "imes", "qzss", "navic"]
+    assert saved.port == 2948 and saved.host is None  # only the changed field is saved
+    assert not log_dir.exists()  # created only when logging starts
+
+
+async def test_settings_open_with_saved_values(tmp_path, config_file):
+    config_mod.save(Config(log_format="csv", log_dir=str(tmp_path), display_gnss=["gps", "qzss"]))
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        assert screen.query_one("#select-log-format", Select).value == "csv"
+        assert screen.query_one("#input-log-dir", Input).value == str(tmp_path)
+        checked = {c.id for c in screen.query("#gnss-checkboxes Checkbox") if c.value}
+        assert checked == {"chk-gnss-gps", "chk-gnss-qzss"}
+
+
+async def test_filter_from_config_applies_to_every_view(config_file, make_gps_data):
+    config_mod.save(Config(display_gnss=["gps"]))
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        data = make_gps_data()
+        app._gps_data = data
+        app._refresh_ui()
+        await pilot.pause()
+        signal = app.query_one("#w-signal").render().plain
+        assert "GP05" in signal and "GA11" not in signal and "GL08" not in signal
+        assert "hidden by filter" in signal
+        sky = app.query_one("#w-skyplot").render().plain
+        assert sky.count("#") == 2 and sky.count("o") == 1  # GP05, GP12 used; GP25 not
+        # Fix data and status bar are not filtered
+        assert "3 used / 7 vis" in app.query_one("#w-fix").render().plain
+        assert "2GP+1GA/7sv" in app.query_one("#w-connection").render().plain
+        app.query_one(TabbedContent).active = "tab-satellites"
+        await pilot.pause()
+        table = app.query_one("#w-sattable").render().plain
+        assert "GA " not in table and "GL " not in table and "GP " in table
+        assert "4 satellites hidden" in table
+        panel = app.query_one("#w-constellations").render().plain
+        assert "Galileo   1/1  (hidden)" in panel
+        assert "3 used / 7 visible" in panel
+        assert data.satellites_used == 3  # data itself is untouched

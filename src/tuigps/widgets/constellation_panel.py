@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from rich.style import Style
 from rich.text import Text
+from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..constants import GNSS_COLORS, GNSS_NAMES
@@ -20,6 +21,10 @@ class ConstellationPanel(Static):
         padding: 0 1;
     }
     """
+
+    # gnssids hidden by the constellation display filter: still counted
+    # here, but marked "(hidden)" (changing it repaints)
+    hidden_gnss: reactive[frozenset[int]] = reactive(frozenset())
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -44,7 +49,8 @@ class ConstellationPanel(Static):
         total_vis = 0
         total_used = 0
 
-        # Display each constellation on a line, two per row
+        # Counts cover every constellation; hidden ones are marked
+        hidden = self.hidden_gnss
         entries = []
         for gnssid in sorted(counts.keys()):
             vis, used = counts[gnssid]
@@ -52,19 +58,21 @@ class ConstellationPanel(Static):
             total_used += used
             name = GNSS_NAMES.get(gnssid, f"GNSS-{gnssid}")
             color = GNSS_COLORS.get(gnssid, "white")
-            entries.append((name, vis, used, color))
+            entries.append((name, vis, used, color, gnssid in hidden))
 
         # Two columns
         for i in range(0, len(entries), 2):
-            name1, vis1, used1, color1 = entries[i]
-            txt.append(f"  {name1:<8}", style=Style(color=color1))
-            txt.append(f" {used1:>2}/{vis1:<2}", style="white")
-
-            if i + 1 < len(entries):
-                name2, vis2, used2, color2 = entries[i + 1]
-                txt.append("   ", style="")
-                txt.append(f"{name2:<8}", style=Style(color=color2))
-                txt.append(f" {used2:>2}/{vis2:<2}", style="white")
+            pair = entries[i:i + 2]
+            for j, (name, vis, used, color, is_hidden) in enumerate(pair):
+                txt.append("   " if j else "  ")
+                if is_hidden:
+                    txt.append(f"{name:<8} {used:>2}/{vis:<2}", style="dim")
+                    txt.append(" (hidden)", style="dim italic")
+                else:
+                    txt.append(f"{name:<8}", style=Style(color=color))
+                    txt.append(f" {used:>2}/{vis:<2}", style="white")
+                    if j == 0 and len(pair) > 1:
+                        txt.append(" " * 9)  # keep the second column aligned
             txt.append("\n")
 
         txt.append("  ─────────────────\n", style="bright_black")

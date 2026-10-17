@@ -209,30 +209,54 @@ NMEAViewer {
 /* ─── Settings modal ─── */
 
 #settings-dialog {
-    width: 70;
-    max-width: 80;
+    width: 84;
+    max-width: 100%;
     height: auto;
-    max-height: 36;
+    max-height: 100%;
     border: heavy $accent;
     background: $surface;
-    padding: 1 2;
-}
-
-#settings-dialog Label {
-    margin: 1 0 0 0;
+    padding: 0 1;
 }
 
 #settings-dialog .settings-title {
     text-style: bold;
     width: 100%;
     content-align: center middle;
-    margin-bottom: 1;
+}
+
+#settings-body {
+    height: auto;
+    max-height: 80vh;
+}
+
+.settings-row {
+    height: auto;
+}
+
+.settings-field {
+    width: 1fr;
+    height: auto;
+    margin: 0 1 0 0;
+}
+
+.settings-field.settings-narrow {
+    width: 24;
+}
+
+#gnss-label {
+    width: 100%;
+    margin: 1 0 0 0;
+}
+
+.field-error {
+    width: 100%;
+    color: $error;
+    display: none;
 }
 
 #settings-buttons {
     layout: horizontal;
     height: auto;
-    margin-top: 1;
     align: center middle;
 }
 
@@ -241,12 +265,16 @@ NMEAViewer {
 }
 
 #gnss-checkboxes {
+    grid-size: 4;
+    grid-gutter: 0 1;
     height: auto;
-    margin: 0 0;
 }
 
 #gnss-checkboxes Checkbox {
-    width: auto;
-    margin: 0 1 0 0;
+    width: 100%;
     height: auto;
+}
+
+SettingsScreen {
+    align: center middle;
 }

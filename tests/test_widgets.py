@@ -534,3 +534,76 @@ async def test_nmea_viewer_batch_matches_single_appends():
         await _press(pilot, batched, "btn-nmea-pause")
         assert _log_lines(batched.query_one("#nmea-log", RichLog))[-2:] == ["$GPGGA,7*00", "$GPGGA,9*00"]
         assert batched._type_counts["GGA"] == 5 and batched._total == 10
+
+
+# ─── Constellation display filter (F8) ──────────────────────────────────
+
+
+async def test_sky_plot_hides_filtered_constellations(make_gps_data):
+    sky = SkyPlot()
+    app = Harness(sky, height=24)
+    async with app.run_test(size=(80, 30)):
+        sky.update_gps_data(make_gps_data())
+        before = sky.render().plain
+        assert before.count("#") == 3  # used: GP05, GP12, GA11
+        assert before.count("o") == 2  # unused: GP25, GL08
+        sky.hidden_gnss = frozenset({2, 6})
+        after = sky.render().plain
+        assert after.count("#") == 2 and after.count("o") == 1
+
+
+async def test_signal_chart_all_hidden(make_gps_data):
+    chart = SignalChart()
+    app = Harness(chart, height=20)
+    async with app.run_test(size=(80, 30)):
+        chart.update_gps_data(make_gps_data())
+        chart.hidden_gnss = frozenset(range(8))
+        plain = chart.render().plain
+        assert "No satellites" in plain and "(7 hidden by filter)" in plain
+        chart.hidden_gnss = frozenset({0})
+        plain = chart.render().plain
+        assert "GP05" not in plain and "GA11" in plain
+        assert "(3 hidden by filter)" in plain
+        assert "GP " not in plain.split("=Used")[1]  # legend lists shown constellations only
+
+
+async def test_filter_change_repaints_without_new_data(make_gps_data, monkeypatch):
+    widgets = [SkyPlot(), SignalChart(), SatelliteTable(), ConstellationPanel()]
+
+    class All(App):
+        def compose(self):
+            yield from widgets
+
+    async with All().run_test(size=(100, 80)) as pilot:
+        data = make_gps_data()
+        for w in widgets:
+            w.update_gps_data(data)
+        await pilot.pause()
+        repaints = {id(w): 0 for w in widgets}
+        for w in widgets:
+            monkeypatch.setattr(w, "refresh", lambda *a, _w=w, **k: repaints.__setitem__(id(_w), repaints[id(_w)] + 1))
+            w.hidden_gnss = frozenset()  # unchanged: no repaint
+        assert set(repaints.values()) == {0}
+        for w in widgets:
+            w.hidden_gnss = frozenset({6})
+        assert all(n >= 1 for n in repaints.values())
+
+
+async def test_satellite_table_and_constellation_panel_filter(make_gps_data):
+    table, panel = SatelliteTable(), ConstellationPanel()
+
+    class Both(App):
+        def compose(self):
+            yield panel
+            yield table
+
+    async with Both().run_test(size=(100, 60)):
+        data = make_gps_data()
+        table.update_gps_data(data)
+        panel.update_gps_data(data)
+        table.hidden_gnss = panel.hidden_gnss = frozenset({1})
+        t = table.render().plain
+        assert "SB " not in t and "1 satellite hidden" in t
+        p = panel.render().plain
+        assert "SBAS      0/1  (hidden)" in p
+        assert "GPS       2/3" in p and "(hidden)" not in p.split("SBAS")[0]

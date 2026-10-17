@@ -7,6 +7,7 @@ from itertools import groupby
 
 from rich.style import Style
 from rich.text import Span, Text
+from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..constants import GNSS_COLORS
@@ -122,6 +123,9 @@ class SkyPlot(Static):
 
     MAX_CACHED_SIZES = 4
 
+    # gnssids hidden by the constellation display filter (changing it repaints)
+    hidden_gnss: reactive[frozenset[int]] = reactive(frozenset())
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._data: GPSData | None = None
@@ -151,8 +155,11 @@ class SkyPlot(Static):
         chars: dict[int, list[str]] = {}
         keys: dict[int, list[StyleKey]] = {}
 
+        hidden = self.hidden_gnss
         if self._data and self._data.satellites:
             for sat in self._data.satellites:
+                if sat.gnssid in hidden:
+                    continue
                 if not math.isfinite(sat.elevation) or not math.isfinite(sat.azimuth):
                     continue
                 if sat.elevation < 0:

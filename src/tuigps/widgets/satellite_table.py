@@ -6,6 +6,7 @@ import math
 
 from rich.style import Style
 from rich.text import Text
+from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..constants import GNSS_COLORS, GNSS_NAMES, GNSS_SHORT
@@ -21,6 +22,9 @@ class SatelliteTable(Static):
         padding: 0 1;
     }
     """
+
+    # gnssids hidden by the constellation display filter (changing it repaints)
+    hidden_gnss: reactive[frozenset[int]] = reactive(frozenset())
 
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
@@ -48,7 +52,12 @@ class SatelliteTable(Static):
             return txt
 
         # Sort by constellation, then by PRN
-        sats = sorted(self._data.satellites, key=lambda s: (s.gnssid, s.prn))
+        hidden = self.hidden_gnss
+        sats = sorted(
+            (s for s in self._data.satellites if s.gnssid not in hidden),
+            key=lambda s: (s.gnssid, s.prn),
+        )
+        n_hidden = len(self._data.satellites) - len(sats)
 
         for sat in sats:
             color = GNSS_COLORS.get(sat.gnssid, "white")
@@ -98,4 +107,10 @@ class SatelliteTable(Static):
 
             txt.append("\n")
 
+        if n_hidden:
+            txt.append(
+                f"  {n_hidden} satellite{'s' if n_hidden != 1 else ''} hidden by the "
+                "constellation filter (Settings)\n",
+                style="dim",
+            )
         return txt

@@ -105,6 +105,7 @@ class TuiGPS(App):
         self._gps_data = GPSData()
         self._units = cfg.units
         self._coord_format = cfg.coord_format
+        self._hidden_gnss = cfg.hidden_gnss_ids  # constellation display filter
         self._theme_list: list[str] = []
         self._theme_index = 0
         self._gps_logger = GPSLogger()
@@ -410,6 +411,8 @@ class TuiGPS(App):
                     widget.units = self._units
                 if hasattr(widget, "coord_format"):
                     widget.coord_format = self._coord_format
+                if hasattr(widget, "hidden_gnss"):
+                    widget.hidden_gnss = self._hidden_gnss
                 widget.update_gps_data(data)
 
     def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
@@ -505,8 +508,10 @@ class TuiGPS(App):
             new_port = result.get("port", session_port)
             self._units = result.get("units", self._units)
             self._coord_format = result.get("coord_format", self._coord_format)
-            if "display_gnss" in result:
-                cfg.display_gnss = list(result["display_gnss"])
+            cfg.display_gnss = list(result.get("display_gnss", cfg.display_gnss))
+            cfg.log_format = result.get("log_format", cfg.log_format)
+            cfg.log_dir = result.get("log_dir", cfg.log_dir)
+            self._hidden_gnss = cfg.hidden_gnss_ids
             # A server given on the command line (or by GPSD_HOST/GPSD_PORT) is
             # only saved when the user actually changes it here.
             if new_host != session_host:
@@ -536,7 +541,9 @@ class TuiGPS(App):
                 port=session_port,
                 units=self._units,
                 coord_format=self._coord_format,
-                enabled_gnss=set(self._config.display_gnss),
+                log_format=self._config.log_format,
+                log_dir=self._config.log_dir,
+                display_gnss=self._config.display_gnss,
             ),
             callback=on_settings_result,
         )
