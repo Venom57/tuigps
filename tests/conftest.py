@@ -73,6 +73,17 @@ def _no_real_subprocess(monkeypatch):
     monkeypatch.setattr(subprocess, "run", _refuse)
 
 
+@pytest.fixture(autouse=True)
+def _ntp_state_unknown(monkeypatch):
+    """DeviceConfig asks timedatectl for the NTP state on mount: answer "unknown".
+
+    Tests of the NTP state display or of ``ntp_enabled`` itself patch it again.
+    """
+    from tuigps import clock_sync
+
+    monkeypatch.setattr(clock_sync, "ntp_enabled", lambda: None)
+
+
 def sample_satellites():
     from tuigps.data_model import SatelliteInfo
 

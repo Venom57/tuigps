@@ -418,6 +418,8 @@ async def test_armed_clock_sync_fires_on_update(make_gps_data, monkeypatch):
         await pilot.pause()
         app.query_one("#btn-arm-clock", Button).press()
         await pilot.pause()
+        app.screen.query_one("#confirm-yes", Button).press()  # arming asks first
+        await pilot.pause()
         assert app._armed_clock_set
         # A non-TPV message does not fire the armed sync (F1)...
         await asyncio.to_thread(app._on_gpsd_update, make_gps_data(tpv_seq=0))

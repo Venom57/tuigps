@@ -8,6 +8,7 @@ import pytest
 from textual.app import App, ComposeResult
 from textual.widgets import Button, Input, RichLog, Select
 
+from tuigps.screens.confirm_screen import ConfirmScreen
 from tuigps.widgets import device_config as dc
 from tuigps.widgets.device_config import DeviceConfig
 
@@ -46,9 +47,18 @@ async def press(pilot, w, btn_id):
     await pilot.pause()
 
 
+async def answer(pilot, app, confirm: bool) -> str:
+    """Answer the open confirmation dialog; returns its title and message."""
+    screen = app.screen
+    assert isinstance(screen, ConfirmScreen)
+    text = f"{screen._title}\n{screen._message}"
+    screen.query_one("#confirm-yes" if confirm else "#confirm-no", Button).press()
+    await pilot.pause()
+    assert not isinstance(app.screen, ConfirmScreen)
+    return text
+
+
 SIMPLE_BUTTONS = [
-    ("btn-save", "-p SAVE"),
-    ("btn-coldboot", "-p COLDBOOT"),
     ("btn-read", "-p CFG-NAV5"),
     ("btn-read-rate", "-p CFG-RATE"),
     ("btn-gnss-read", "-p CFG-GNSS"),
@@ -142,6 +152,7 @@ async def test_pps_apply_and_disable(ubx_calls):
         w = app.query_one(DeviceConfig)
         await press(pilot, w, "btn-pps-apply")
         await press(pilot, w, "btn-pps-disable")
+        await answer(pilot, app, True)
         out = log_text(w)
     assert ubx_calls[0] == "-c " + w._build_tp5_cmd(1, 100000, True)
     assert ubx_calls[1] == "-c " + w._build_tp5_cmd(0, 0, False)
@@ -198,6 +209,7 @@ async def test_arm_clock_toggle():
         w = app.query_one(DeviceConfig)
         btn = w.query_one("#btn-arm-clock", Button)
         await press(pilot, w, "btn-arm-clock")
+        await answer(pilot, app, True)
         assert app._armed_clock_set is True
         assert btn.variant == "success"
         await press(pilot, w, "btn-arm-clock")
@@ -223,6 +235,7 @@ async def test_set_clock_now_uses_clock_sync(make_gps_data, monkeypatch):
         w = app.query_one(DeviceConfig)
         w.update_gps_data(data)
         await press(pilot, w, "btn-set-clock")
+        await answer(pilot, app, True)
         assert await wait_for(pilot, lambda: "System clock set to: fake" in log_text(w))
     assert calls == [(data.time, data.tpv_received)]
 
@@ -303,6 +316,7 @@ async def test_set_baud_rate(make_gps_data, monkeypatch):
         w.update_gps_data(make_gps_data())
         w.query_one("#sel-baud", Select).value = 115200
         await press(pilot, w, "btn-baud")
+        await answer(pilot, app, True)
         assert await wait_for(pilot, lambda: "Baud rate set to 115200" in log_text(w))
     assert calls == [
         ["ubxtool", "-P", "18", "-S", "115200"],
@@ -347,6 +361,7 @@ async def test_pps_sync_applies_relative_offset(make_gps_data, monkeypatch):
         w = app.query_one(DeviceConfig)
         w.update_gps_data(make_gps_data(**overrides))
         await press(pilot, w, "btn-pps-sync")
+        await answer(pilot, app, True)
         assert await wait_for(pilot, lambda: "PPS-disciplined" in log_text(w))
         out = log_text(w)
     assert "PPS pulse #7" in out and "Clock offset: -2.000 ms" in out
@@ -364,6 +379,7 @@ async def test_pps_sync_failure_reports_each_command(make_gps_data, monkeypatch)
         w = app.query_one(DeviceConfig)
         w.update_gps_data(make_gps_data(**overrides))
         await press(pilot, w, "btn-pps-sync")
+        await answer(pilot, app, True)
         assert await wait_for(pilot, lambda: "could not apply PPS offset" in log_text(w))
         out = log_text(w)
     assert "busctl: busctl-err" in out

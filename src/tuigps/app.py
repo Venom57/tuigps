@@ -444,7 +444,7 @@ class TuiGPS(App):
         """Show clock sync result in Device tab output and as notification."""
         with self._ui_guard("clock result"):
             config = self._device_config or self.query_one("#w-device-config", DeviceConfig)
-            config._append_output(message)
+            config.report_clock_result(message)
             # Reset the arm button
             btn = config.query_one("#btn-arm-clock", Button)
             btn.variant = "warning"

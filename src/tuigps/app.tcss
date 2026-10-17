@@ -180,6 +180,12 @@ DeviceConfig {
     margin-right: 1;
 }
 
+#ntp-state {
+    height: 3;
+    content-align: left middle;
+    margin-left: 1;
+}
+
 .gnss-btn {
     min-width: 10;
 }

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import fcntl
 import glob
@@ -18,8 +19,10 @@ from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.widgets import Button, Input, Label, RichLog, Select
 
-from ..clock_sync import set_clock_from_gps
+from .. import clock_sync
+from ..clock_sync import NTP_DISABLED_HINT, set_clock_from_gps
 from ..data_model import GPSData
+from ..screens.confirm_screen import ConfirmScreen
 from ..timeutil import parse_gps_time
 
 
@@ -130,6 +133,59 @@ BAUD_RATES = [
 # GNSS constellations for device config
 CONSTELLATIONS = ["GPS", "GLONASS", "GALILEO", "BEIDOU", "SBAS", "QZSS"]
 
+# Setting the clock always turns NTP off first (it would undo the change)
+_NTP_OFF = (
+    "NTP time sync will be disabled (timedatectl set-ntp false); "
+    "use Re-enable NTP to turn it back on."
+)
+
+# Confirmation dialogs: button id -> (title, message, confirm button label)
+CONFIRMATIONS: dict[str, tuple[str, str, str]] = {
+    "btn-coldboot": (
+        "Cold boot the receiver?",
+        "The receiver discards its stored ephemeris, almanac, position and time "
+        "and restarts. Getting a fix again can take several minutes.",
+        "Cold Boot",
+    ),
+    "btn-save": (
+        "Save configuration to the receiver?",
+        "Writes the receiver's current configuration to its non-volatile memory "
+        "(battery-backed RAM / flash). It will persist across power cycles.",
+        "Save",
+    ),
+    "btn-pps-disable": (
+        "Disable PPS?",
+        "Turns off the receiver's timepulse output. Anything disciplined by PPS "
+        "(chrony, ntpd, Set Clock (PPS)) loses its reference until PPS is applied again.",
+        "Disable PPS",
+    ),
+    "btn-baud": (
+        "Change the serial speed to {speed}?",
+        "The receiver switches to {speed} baud, then gpsd is told to follow. If either "
+        "step fails, gpsd may lose contact with the receiver; recover by power-cycling "
+        "the receiver or with 'gpsctl -s <speed>'.",
+        "Change Speed",
+    ),
+    "btn-set-clock": (
+        "Set the system clock now?",
+        "Sets the system clock from the latest GPS fix (corrected for its age). "
+        + _NTP_OFF,
+        "Set Clock",
+    ),
+    "btn-pps-sync": (
+        "Set the system clock on the next PPS pulse?",
+        "Waits for the next PPS pulse and steps the system clock to the GPS second "
+        "it marks. " + _NTP_OFF,
+        "Set Clock",
+    ),
+    "btn-arm-clock": (
+        "Arm clock sync?",
+        "The system clock will be set from the next GPS fix as soon as it arrives. "
+        + _NTP_OFF,
+        "Arm",
+    ),
+}
+
 
 class DeviceConfig(Vertical):
     """u-blox 8 device configuration via ubxtool."""
@@ -234,6 +290,8 @@ class DeviceConfig(Vertical):
                 yield Button("Arm Clock Sync", id="btn-arm-clock", variant="warning")
                 yield Button("Set Clock (now)", id="btn-set-clock", variant="warning")
                 yield Button("Set Clock (PPS)", id="btn-pps-sync", variant="warning")
+                yield Button("Re-enable NTP", id="btn-ntp-on", variant="default")
+                yield Label("NTP: ?", id="ntp-state")
 
             with Horizontal(classes="config-row"):
                 yield Label("ubxtool cmd:    ", classes="config-label")
@@ -263,7 +321,8 @@ class DeviceConfig(Vertical):
         elif btn_id == "btn-baud":
             value = self._selected("#sel-baud")
             if value is not None:
-                self._set_baud_rate(int(value))
+                speed = int(value)
+                self._confirm(btn_id, lambda: self._set_baud_rate(speed), speed=speed)
         elif btn_id == "btn-baud-read":
             self._run_ubxtool("-p CFG-PRT")
         elif btn_id == "btn-pps-apply":
@@ -273,13 +332,13 @@ class DeviceConfig(Vertical):
             dur = dur_sel.value if dur_sel.value is not Select.NULL else 100000
             self._send_tp5(freq_hz=int(freq), pulse_us=int(dur), active=True)
         elif btn_id == "btn-pps-disable":
-            self._send_tp5(freq_hz=0, pulse_us=0, active=False)
+            self._confirm(btn_id, lambda: self._send_tp5(freq_hz=0, pulse_us=0, active=False))
         elif btn_id == "btn-pps-read":
             self._run_ubxtool("-p CFG-TP5")
         elif btn_id == "btn-save":
-            self._run_ubxtool("-p SAVE")
+            self._confirm(btn_id, lambda: self._run_ubxtool("-p SAVE"))
         elif btn_id == "btn-coldboot":
-            self._run_ubxtool("-p COLDBOOT")
+            self._confirm(btn_id, lambda: self._run_ubxtool("-p COLDBOOT"))
         elif btn_id == "btn-read":
             self._run_ubxtool("-p CFG-NAV5")
         elif btn_id == "btn-read-rate":
@@ -287,11 +346,18 @@ class DeviceConfig(Vertical):
         elif btn_id == "btn-gnss-read":
             self._run_ubxtool("-p CFG-GNSS")
         elif btn_id == "btn-arm-clock":
-            self._arm_clock_sync()
+            if self.app._armed_clock_set:
+                self._arm_clock_sync()  # disarming needs no confirmation
+            else:
+                self._confirm(btn_id, self._arm_clock_sync)
         elif btn_id == "btn-set-clock":
-            self._set_system_clock()
+            if self._gps_time_available():
+                self._confirm(btn_id, self._set_system_clock)
         elif btn_id == "btn-pps-sync":
-            self._pps_sync_clock()
+            if self._pps_sync_params() is not None:
+                self._confirm(btn_id, self._pps_sync_clock)
+        elif btn_id == "btn-ntp-on":
+            self._enable_ntp()
         elif btn_id == "btn-run-cmd":
             inp = self.query_one("#input-cmd", Input)
             if inp.value.strip():
@@ -306,6 +372,18 @@ class DeviceConfig(Vertical):
                 self._run_ubxtool(f"-e {gnss}")
                 self._gnss_enabled[gnss] = True
             self._update_gnss_buttons()
+
+    def _confirm(self, action_id: str, action, **fmt) -> None:
+        """Run ``action`` once the user confirms the CONFIRMATIONS[action_id] dialog."""
+        title, message, label = CONFIRMATIONS[action_id]
+
+        def on_result(confirmed: bool | None) -> None:
+            if confirmed:
+                action()
+
+        self.app.push_screen(
+            ConfirmScreen(title.format(**fmt), message.format(**fmt), label), on_result
+        )
 
     def _selected(self, select_id: str):
         """Return a Select's value, or None (with a hint) when nothing is selected."""
@@ -345,10 +423,15 @@ class DeviceConfig(Vertical):
             btn.variant = "success"
             btn.label = "ARMED (click to cancel)"
 
-    def _set_system_clock(self) -> None:
-        """Set the system clock immediately from current GPS time."""
+    def _gps_time_available(self) -> bool:
         if not self._data or not self._data.time:
             self._append_output("Error: no GPS time available")
+            return False
+        return True
+
+    def _set_system_clock(self) -> None:
+        """Set the system clock immediately from current GPS time."""
+        if not self._gps_time_available():
             return
 
         gps_time = self._data.time
@@ -359,7 +442,7 @@ class DeviceConfig(Vertical):
         def run():
             try:
                 msg = set_clock_from_gps(gps_time, received)
-                self.app.call_from_thread(self._append_output, msg)
+                self.app.call_from_thread(self.report_clock_result, msg)
             except Exception as e:
                 self.app.call_from_thread(self._append_output, f"Error: {e}")
 
@@ -393,6 +476,31 @@ class DeviceConfig(Vertical):
             if fd is not None:
                 os.close(fd)
 
+    def _pps_sync_params(self) -> tuple[str, float, float] | None:
+        """(PPS device, GPS epoch, TPV receipt time) for a PPS sync, or None.
+
+        Problems (no GPS time, no PPS device, bad time) are reported in the log.
+        """
+        if not self._data or not self._data.time or self._data.tpv_received <= 0:
+            self._append_output("Error: no GPS time available for PPS sync")
+            return None
+
+        pps_dev = self._find_pps_device()
+        if not pps_dev:
+            self._append_output(
+                "Error: no PPS device found (/dev/pps*)\n"
+                "  Tip: modprobe pps_gpio or pps_ldisc, or check GPS wiring"
+            )
+            return None
+
+        gps_time_str = self._data.time
+        gps_epoch = parse_gps_time(gps_time_str)
+        if gps_epoch is None:
+            self._append_output(f"Error: cannot parse GPS time {gps_time_str!r}")
+            return None
+        # Fix age reference: receipt of the TPV that carried this time
+        return pps_dev, gps_epoch, self._data.tpv_received
+
     def _pps_sync_clock(self) -> None:
         """Set system clock precisely using PPS pulse edge timing.
 
@@ -403,25 +511,10 @@ class DeviceConfig(Vertical):
         4. Apply relative adjustment via D-Bus SetTime
         The delay between ioctl return and SetTime cancels out mathematically.
         """
-        if not self._data or not self._data.time or self._data.tpv_received <= 0:
-            self._append_output("Error: no GPS time available for PPS sync")
+        params = self._pps_sync_params()
+        if params is None:
             return
-
-        pps_dev = self._find_pps_device()
-        if not pps_dev:
-            self._append_output(
-                "Error: no PPS device found (/dev/pps*)\n"
-                "  Tip: modprobe pps_gpio or pps_ldisc, or check GPS wiring"
-            )
-            return
-
-        gps_time_str = self._data.time
-        gps_epoch = parse_gps_time(gps_time_str)
-        if gps_epoch is None:
-            self._append_output(f"Error: cannot parse GPS time {gps_time_str!r}")
-            return
-        # Fix age reference: receipt of the TPV that carried this time
-        received = self._data.tpv_received
+        pps_dev, gps_epoch, received = params
         self._append_output(f"PPS sync: waiting for pulse on {pps_dev}...")
 
         def run():
@@ -485,7 +578,7 @@ class DeviceConfig(Vertical):
 
                 if result.returncode == 0:
                     self.app.call_from_thread(
-                        self._append_output,
+                        self.report_clock_result,
                         f"System clock adjusted by {offset_ms:+.3f} ms (PPS-disciplined)",
                     )
                 else:
@@ -499,7 +592,7 @@ class DeviceConfig(Vertical):
                     )
                     if result.returncode == 0:
                         self.app.call_from_thread(
-                            self._append_output,
+                            self.report_clock_result,
                             f"System clock set to {utc_str} UTC (sudo fallback, ~1s precision)",
                         )
                     else:
@@ -636,6 +729,41 @@ class DeviceConfig(Vertical):
                 self.app.call_from_thread(self._append_output, f"Error: {e}")
 
         threading.Thread(target=run, daemon=True).start()
+
+    # ─── NTP ─────────────────────────────────────────────────
+
+    def on_mount(self) -> None:
+        self._refresh_ntp_state()
+
+    def report_clock_result(self, message: str) -> None:
+        """Log a clock-setting result; after a successful set, remind about NTP."""
+        self._append_output(message)
+        if message.startswith("System clock"):
+            self._append_output(NTP_DISABLED_HINT)
+        self._refresh_ntp_state()
+
+    def _enable_ntp(self) -> None:
+        """Turn NTP time sync back on (timedatectl set-ntp true, in a worker thread)."""
+        self._append_output("$ timedatectl set-ntp true")
+
+        async def enable() -> None:
+            message = await asyncio.to_thread(clock_sync.set_ntp, True)
+            self._append_output(message)
+            await self._load_ntp_state()
+
+        self.run_worker(enable(), group="ntp")
+
+    def _refresh_ntp_state(self) -> None:
+        self.run_worker(self._load_ntp_state(), group="ntp-state", exclusive=True)
+
+    async def _load_ntp_state(self) -> None:
+        """Show whether NTP sync is on (timedatectl show, in a worker thread)."""
+        enabled = await asyncio.to_thread(clock_sync.ntp_enabled)
+        text = {True: "NTP: on", False: "NTP: off"}.get(enabled, "NTP: ?")
+        try:
+            self.query_one("#ntp-state", Label).update(text)
+        except NoMatches:
+            pass
 
     def _append_output(self, text: str) -> None:
         """Add text to the output log."""

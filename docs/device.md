@@ -53,6 +53,9 @@ Toggle buttons to enable/disable GNSS constellations on the receiver. Green indi
 - **Arm Clock Sync** — Arms a clock sync that fires on the very next gpsd message for minimum latency. Click again to disarm.
 - **Set Clock (now)** — Sets the system clock from the latest GPS time, compensating for fix age. Uses D-Bus timedated (no sudo required on most desktop systems), with timedatectl and sudo -n fallbacks.
 - **Set Clock (PPS)** — PPS-disciplined clock sync for sub-millisecond accuracy. Blocks on the kernel PPS ioctl (`PPS_FETCH`) to capture the exact timestamp of the next PPS pulse edge, computes the offset between the kernel timestamp and the GPS second the pulse marks, then applies a relative adjustment via D-Bus SetTime. Requires a `/dev/pps*` device (e.g., `pps_gpio` or `pps_ldisc` kernel module).
+- **Re-enable NTP** — Setting the clock turns systemd NTP sync off (`timedatectl set-ntp false`), or it would undo the change. This button turns it back on (`timedatectl set-ntp true`). The label next to it shows the current NTP state (`timedatectl show -p NTP`).
+
+Arming and both Set Clock buttons ask for confirmation first, and say that NTP will be disabled.
 
 ### Utility Buttons
 - **Save Config** — Save current configuration to receiver flash (persists across power cycles)
@@ -60,6 +63,8 @@ Toggle buttons to enable/disable GNSS constellations on the receiver. Green indi
 - **Read Nav** — Read current CFG-NAV5 navigation configuration
 - **Read Rate** — Read current CFG-RATE update rate configuration
 - **Read GNSS** — Read current CFG-GNSS constellation configuration
+
+Cold Boot, Save Config, Disable PPS and changing the serial speed also ask for confirmation (Cancel has the focus; Escape cancels). A serial speed change can lose contact with the receiver if the receiver and gpsd do not both switch.
 
 ### Raw Command Input
 Enter any ubxtool command arguments directly (e.g., `-p MON-VER` to read firmware version). Output appears in the log area below.

@@ -90,3 +90,46 @@ def set_clock_from_gps(
         f"  or add to sudoers: {os.environ.get('USER', 'user')} "
         f"ALL=(ALL) NOPASSWD: /usr/bin/date"
     )
+
+
+# Shown after the clock has been set: setting it turns NTP off.
+NTP_DISABLED_HINT = "NTP is disabled — press Re-enable NTP to restore automatic time sync"
+
+
+def set_ntp(enabled: bool) -> str:
+    """Turn systemd NTP time sync on or off; returns a status message.
+
+    Runs synchronously (``timedatectl set-ntp``): call from a worker thread.
+    """
+    value = "true" if enabled else "false"
+    try:
+        result = subprocess.run(
+            ["timedatectl", "set-ntp", value],
+            capture_output=True, text=True, timeout=10,
+        )
+    except FileNotFoundError:
+        return "Error: timedatectl not found"
+    except subprocess.TimeoutExpired:
+        return f"Error: timedatectl set-ntp {value} timed out"
+    if result.returncode == 0:
+        return "NTP enabled: automatic time sync restored" if enabled else "NTP disabled"
+    err = result.stderr.strip() or result.stdout.strip() or f"exit status {result.returncode}"
+    return f"Error: timedatectl set-ntp {value} failed: {err}"
+
+
+def ntp_enabled() -> bool | None:
+    """Whether systemd NTP time sync is on; None when it cannot be determined.
+
+    Runs synchronously (``timedatectl show -p NTP --value``): call from a
+    worker thread.
+    """
+    try:
+        result = subprocess.run(
+            ["timedatectl", "show", "-p", "NTP", "--value"],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return {"yes": True, "no": False}.get(result.stdout.strip().lower())
