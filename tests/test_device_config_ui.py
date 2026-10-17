@@ -405,3 +405,35 @@ async def test_pps_sync_unparseable_time(make_gps_data, monkeypatch):
         w.update_gps_data(make_gps_data(time="garbage"))
         await press(pilot, w, "btn-pps-sync")
         assert "cannot parse GPS time 'garbage'" in log_text(w)
+
+
+async def test_pps_sync_failure_restores_ntp_that_was_on(make_gps_data, monkeypatch):
+    monkeypatch.setattr(dc.clock_sync, "ntp_enabled", lambda: True)
+    calls, overrides = _pps_setup(
+        monkeypatch, {"busctl": (1, "busctl-err"), "sudo": (1, "sudo-err")},
+    )
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(**overrides))
+        await press(pilot, w, "btn-pps-sync")
+        await answer(pilot, app, True)
+        assert await wait_for(pilot, lambda: "NTP was re-enabled" in log_text(w))
+        out = log_text(w)
+    assert calls[0] == ["timedatectl", "set-ntp", "false"]
+    assert calls[-1] == ["timedatectl", "set-ntp", "true"]
+    assert "could not apply PPS offset" in out
+    assert dc.NTP_DISABLED_HINT not in out
+
+
+async def test_pps_sync_success_leaves_ntp_off(make_gps_data, monkeypatch):
+    monkeypatch.setattr(dc.clock_sync, "ntp_enabled", lambda: True)
+    calls, overrides = _pps_setup(monkeypatch, {})
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(**overrides))
+        await press(pilot, w, "btn-pps-sync")
+        await answer(pilot, app, True)
+        assert await wait_for(pilot, lambda: dc.NTP_DISABLED_HINT in log_text(w))
+    assert ["timedatectl", "set-ntp", "true"] not in calls

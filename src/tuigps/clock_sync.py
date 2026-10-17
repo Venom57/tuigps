@@ -10,6 +10,40 @@ from datetime import datetime, timezone
 from .timeutil import parse_gps_time
 
 
+def run_command(cmd: list[str], timeout: float) -> subprocess.CompletedProcess:
+    """Run a command; a missing program or a timeout is a failed result, not an exception."""
+    try:
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", f"{cmd[0]}: command not found")
+    except subprocess.TimeoutExpired:
+        return subprocess.CompletedProcess(cmd, 124, "", f"{cmd[0]}: timed out after {timeout:g}s")
+
+
+def disable_ntp() -> bool:
+    """Turn NTP sync off before stepping the clock (NTP would undo the change).
+
+    Returns whether NTP was on beforehand, so a failed clock set can turn it
+    back on (see :func:`restore_ntp`). Runs synchronously: call from a thread.
+    """
+    was_on = ntp_enabled() is True
+    set_ntp(False)
+    return was_on
+
+
+def restore_ntp(was_on: bool) -> str:
+    """After a *failed* clock set, turn NTP back on if :func:`disable_ntp` found it on.
+
+    Returns a line for the user ("" when NTP was off and nothing was done).
+    """
+    if not was_on:
+        return ""
+    result = set_ntp(True)
+    if result.startswith("Error"):
+        return f"NTP was on before and could not be re-enabled: {result}"
+    return "NTP was re-enabled (it was on before the attempt)"
+
+
 def set_clock_from_gps(
     gps_time_str: str,
     fix_received: float = 0.0,
@@ -17,6 +51,9 @@ def set_clock_from_gps(
     """Set system clock from a GPS time string. Returns a status message.
 
     Runs synchronously — call from a background thread to avoid blocking the UI.
+
+    NTP is turned off first. If every method of setting the clock fails and
+    NTP was on, it is turned back on (and the message says so).
 
     Args:
         gps_time_str: ISO 8601 GPS time (e.g., "2026-03-14T12:00:00.000Z")
@@ -38,21 +75,18 @@ def set_clock_from_gps(
 
     usec = int(dt.timestamp() * 1_000_000)
 
-    # Disable NTP first
-    subprocess.run(
-        ["timedatectl", "set-ntp", "false"],
-        capture_output=True, text=True, timeout=5,
-    )
+    # Disable NTP first (remembering whether it was on)
+    ntp_was_on = disable_ntp()
 
     # Try D-Bus (absolute UTC usec, allow polkit)
-    result = subprocess.run(
+    result = run_command(
         [
             "busctl", "call", "org.freedesktop.timedate1",
             "/org/freedesktop/timedate1",
             "org.freedesktop.timedate1",
             "SetTime", "xbb", str(usec), "false", "true",
         ],
-        capture_output=True, text=True, timeout=10,
+        timeout=10,
     )
 
     adjusted = dt.strftime("%Y-%m-%d %H:%M:%S.%f")
@@ -64,24 +98,18 @@ def set_clock_from_gps(
     # Fallback: timedatectl (expects local time)
     local_dt = dt.astimezone()
     formatted = local_dt.strftime("%Y-%m-%d %H:%M:%S")
-    result = subprocess.run(
-        ["timedatectl", "set-time", formatted],
-        capture_output=True, text=True, timeout=10,
-    )
+    result = run_command(["timedatectl", "set-time", formatted], timeout=10)
     if result.returncode == 0:
         return f"System clock set to: {formatted} (local, fix age: {fix_age:.3f}s)"
     timedatectl_err = result.stderr.strip()
 
     # Last resort: sudo -n date (passwordless only)
     utc_str = dt.strftime("%Y-%m-%d %H:%M:%S.%f")
-    result = subprocess.run(
-        ["sudo", "-n", "date", "-u", "-s", utc_str],
-        capture_output=True, text=True, timeout=5,
-    )
+    result = run_command(["sudo", "-n", "date", "-u", "-s", utc_str], timeout=5)
     if result.returncode == 0:
         return f"System clock set to: {result.stdout.strip()}"
 
-    return (
+    message = (
         f"Error: could not set time.\n"
         f"  busctl: {busctl_err}\n"
         f"  timedatectl: {timedatectl_err}\n"
@@ -90,6 +118,8 @@ def set_clock_from_gps(
         f"  or add to sudoers: {os.environ.get('USER', 'user')} "
         f"ALL=(ALL) NOPASSWD: /usr/bin/date"
     )
+    restored = restore_ntp(ntp_was_on)
+    return f"{message}\n  {restored}" if restored else message
 
 
 # Shown after the clock has been set: setting it turns NTP off.

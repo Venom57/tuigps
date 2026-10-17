@@ -133,10 +133,12 @@ BAUD_RATES = [
 # GNSS constellations for device config
 CONSTELLATIONS = ["GPS", "GLONASS", "GALILEO", "BEIDOU", "SBAS", "QZSS"]
 
-# Setting the clock always turns NTP off first (it would undo the change)
+# Setting the clock always turns NTP off first (it would undo the change);
+# if setting it then fails, NTP is turned back on when it was on before.
 _NTP_OFF = (
     "NTP time sync will be disabled (timedatectl set-ntp false); "
-    "use Re-enable NTP to turn it back on."
+    "use Re-enable NTP to turn it back on. If setting the clock fails, "
+    "NTP is restored automatically."
 )
 
 # Confirmation dialogs: button id -> (title, message, confirm button label)
@@ -559,21 +561,18 @@ class DeviceConfig(Vertical):
                     f"  Clock offset: {offset_ms:+.3f} ms",
                 )
 
-                # Disable NTP
-                subprocess.run(
-                    ["timedatectl", "set-ntp", "false"],
-                    capture_output=True, text=True, timeout=5,
-                )
+                # Disable NTP (it would undo the change); remember if it was on
+                ntp_was_on = clock_sync.disable_ntp()
 
                 # Apply relative offset via D-Bus (delay since PPS cancels out)
-                result = subprocess.run(
+                result = clock_sync.run_command(
                     [
                         "busctl", "call", "org.freedesktop.timedate1",
                         "/org/freedesktop/timedate1",
                         "org.freedesktop.timedate1",
                         "SetTime", "xbb", str(offset_usec), "true", "true",
                     ],
-                    capture_output=True, text=True, timeout=10,
+                    timeout=10,
                 )
 
                 if result.returncode == 0:
@@ -586,9 +585,8 @@ class DeviceConfig(Vertical):
                     # Fallback: compute absolute time and use sudo -n date
                     abs_dt = datetime.fromtimestamp(target_sec, tz=timezone.utc)
                     utc_str = abs_dt.strftime("%Y-%m-%d %H:%M:%S")
-                    result = subprocess.run(
-                        ["sudo", "-n", "date", "-u", "-s", utc_str],
-                        capture_output=True, text=True, timeout=5,
+                    result = clock_sync.run_command(
+                        ["sudo", "-n", "date", "-u", "-s", utc_str], timeout=5
                     )
                     if result.returncode == 0:
                         self.app.call_from_thread(
@@ -596,12 +594,15 @@ class DeviceConfig(Vertical):
                             f"System clock set to {utc_str} UTC (sudo fallback, ~1s precision)",
                         )
                     else:
-                        self.app.call_from_thread(
-                            self._append_output,
+                        message = (
                             f"Error: could not apply PPS offset\n"
                             f"  busctl: {busctl_err}\n"
-                            f"  sudo: {result.stderr.strip()}",
+                            f"  sudo: {result.stderr.strip()}"
                         )
+                        restored = clock_sync.restore_ntp(ntp_was_on)
+                        if restored:
+                            message += f"\n  {restored}"
+                        self.app.call_from_thread(self.report_clock_result, message)
             except Exception as e:
                 self.app.call_from_thread(self._append_output, f"PPS sync error: {e}")
 

@@ -162,3 +162,135 @@ def test_nanosecond_gps_time(monkeypatch, now):
     fake = _install(monkeypatch)
     set_clock_from_gps("2026-03-14T12:00:00.250000000Z")
     assert int(fake.calls[1][7]) == int(GPS_EPOCH * 1_000_000)
+
+
+# ─── NTP is restored when setting the clock fails ───────────────────────
+
+
+ALL_FAIL = dict(
+    busctl=(1, "", "busctl-err"),
+    timedatectl_set_time=(1, "", "timedatectl-err"),
+    sudo=(1, "", "sudo-err"),
+)
+
+
+@pytest.fixture
+def ntp_was(monkeypatch):
+    """Set what ``ntp_enabled()`` reports before the clock is set."""
+
+    def _set(state):
+        monkeypatch.setattr(clock_sync, "ntp_enabled", lambda: state)
+
+    return _set
+
+
+def test_failed_set_restores_ntp_that_was_on(monkeypatch, now, ntp_was):
+    ntp_was(True)
+    fake = _install(monkeypatch, **ALL_FAIL)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
+    assert fake.calls[0] == ["timedatectl", "set-ntp", "false"]
+    assert fake.calls[-1] == ["timedatectl", "set-ntp", "true"]
+    assert msg.startswith("Error: could not set time.")
+    assert msg.endswith("NTP was re-enabled (it was on before the attempt)")
+
+
+@pytest.mark.parametrize("state", [False, None])
+def test_failed_set_leaves_ntp_off_when_it_was_not_on(monkeypatch, now, ntp_was, state):
+    """NTP that was off (or in an unknown state) is not turned on by a failure."""
+    ntp_was(state)
+    fake = _install(monkeypatch, **ALL_FAIL)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
+    assert ["timedatectl", "set-ntp", "true"] not in fake.calls
+    assert "NTP was" not in msg
+
+
+def test_successful_set_keeps_ntp_off(monkeypatch, now, ntp_was):
+    """After a successful set NTP stays off (it would undo the change)."""
+    ntp_was(True)
+    fake = _install(monkeypatch)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
+    assert fake.programs() == ["timedatectl set-ntp", "busctl"]
+    assert fake.calls[0][-1] == "false"
+    assert msg.startswith("System clock set to:")
+
+
+def test_failed_restore_is_reported(monkeypatch, now, ntp_was):
+    ntp_was(True)
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        if cmd == ["timedatectl", "set-ntp", "false"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, 1, "", "denied")
+
+    monkeypatch.setattr(clock_sync.subprocess, "run", run)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
+    assert calls[-1] == ["timedatectl", "set-ntp", "true"]
+    assert msg.endswith(
+        "NTP was on before and could not be re-enabled: "
+        "Error: timedatectl set-ntp true failed: denied"
+    )
+
+
+# ─── A missing program or a timeout is a failed method, not a crash ─────
+
+
+def _raising_run(monkeypatch, raises: dict):
+    """subprocess.run that raises ``raises[program]`` and otherwise succeeds."""
+    calls = []
+
+    def run(cmd, **kwargs):
+        calls.append(cmd)
+        exc = raises.get(cmd[0] if cmd[0] != "timedatectl" else " ".join(cmd[:2]))
+        if exc is not None:
+            raise exc
+        return subprocess.CompletedProcess(cmd, 0, "ok", "")
+
+    monkeypatch.setattr(clock_sync.subprocess, "run", run)
+    return calls
+
+
+def test_missing_busctl_falls_back_to_timedatectl(monkeypatch, now):
+    calls = _raising_run(monkeypatch, {"busctl": FileNotFoundError(2, "No such file")})
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
+    assert [c[0] for c in calls] == ["timedatectl", "busctl", "timedatectl"]
+    assert calls[2][1] == "set-time"
+    assert "(local, fix age: 0.500s)" in msg
+
+
+def test_every_method_missing_or_hanging(monkeypatch, now, ntp_was):
+    ntp_was(True)
+    _raising_run(monkeypatch, {
+        "busctl": FileNotFoundError(2, "No such file"),
+        "timedatectl set-time": subprocess.TimeoutExpired(["timedatectl"], 10),
+        "sudo": FileNotFoundError(2, "No such file"),
+    })
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
+    assert "busctl: busctl: command not found" in msg
+    assert "timedatectl: timedatectl: timed out after 10s" in msg
+    assert "sudo: sudo: command not found" in msg
+    assert msg.endswith("NTP was re-enabled (it was on before the attempt)")
+
+
+def test_missing_timedatectl_does_not_prevent_setting_the_clock(monkeypatch, now):
+    calls = _raising_run(
+        monkeypatch, {"timedatectl set-ntp": FileNotFoundError(2, "No such file")}
+    )
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
+    assert calls[1][0] == "busctl"
+    assert msg.startswith("System clock set to:")
+
+
+@pytest.mark.parametrize("state, expected", [(True, True), (False, False), (None, False)])
+def test_disable_ntp_reports_prior_state(monkeypatch, ntp_was, state, expected):
+    ntp_was(state)
+    fake = _install(monkeypatch)
+    assert clock_sync.disable_ntp() is expected
+    assert fake.calls == [["timedatectl", "set-ntp", "false"]]
+
+
+def test_restore_ntp_does_nothing_when_it_was_off(monkeypatch):
+    fake = _install(monkeypatch)
+    assert clock_sync.restore_ntp(False) == ""
+    assert fake.calls == []
