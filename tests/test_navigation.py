@@ -56,20 +56,20 @@ async def test_help_lists_every_binding_and_tab():
             assert description.split()[0] in tabs
 
 
-@pytest.mark.parametrize("open_key", ["question_mark", "f1"])
-@pytest.mark.parametrize("close_key", ["escape", "question_mark", "q"])
-async def test_help_opens_and_closes(open_key, close_key):
+async def test_help_opens_and_closes():
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
-        await pilot.press(open_key)
-        await pilot.pause()
-        assert isinstance(app.screen, HelpScreen)
-        await pilot.press("u")  # app keys are inactive under the modal
-        assert app._units == "metric"
-        await pilot.press(close_key)
-        await pilot.pause()
-        assert not isinstance(app.screen, HelpScreen)
-        assert app.is_running  # "q" closed the help, it did not quit
+        for open_key in ("question_mark", "f1"):
+            for close_key in ("escape", "question_mark", "q"):
+                await pilot.press(open_key)
+                await pilot.pause()
+                assert isinstance(app.screen, HelpScreen), open_key
+                await pilot.press("u")  # app keys are inactive under the modal
+                assert app._units == "metric"
+                await pilot.press(close_key)
+                await pilot.pause()
+                assert not isinstance(app.screen, HelpScreen), close_key
+                assert app.is_running  # "q" closed the help, it did not quit
 
 
 async def test_keys_are_typed_into_device_command_input():
@@ -119,40 +119,41 @@ def test_status_hints_come_from_bindings():
     assert not hasattr(ConnectionStatus, "BINDINGS_DISPLAY")  # no hard-coded copy
 
 
-@pytest.mark.parametrize("width", [40, 80, 120, 200])
 @pytest.mark.parametrize("badges", [False, True])
-async def test_status_bar_fits_and_keeps_status(width, badges, make_gps_data, monkeypatch):
+async def test_status_bar_fits_and_keeps_status(badges, make_gps_data, monkeypatch):
     # No heartbeat refresh: it would reset the badges set below from the app state
     monkeypatch.setattr(TuiGPS, "_heartbeat", lambda self: None)
     app = TuiGPS()
-    async with app.run_test(size=(width, 24)) as pilot:
+    async with app.run_test(size=(200, 24)) as pilot:
         bar = app.query_one("#w-connection", ConnectionStatus)
         bar.logging_active, bar.log_count = badges, 12
         bar.hold_active, bar.hold_count = badges, 3
         app._gps_data = make_gps_data()
         bar.update_gps_data(app._gps_data)
-        await pilot.pause()
-        assert bar.size.width == width
-        text = bar.render()
-        line = text.plain
-        assert text.cell_len <= width
-        assert line.rstrip().endswith("3D Fix  DGPS")  # the status, intact, on the right
-        if badges:
-            assert " REC " in line and " HOLD " in line  # badges beat hints
         labels = [label for _, label in app.key_hints()]
-        if width == 200:
-            assert "2GP+1GA/7sv /dev/ttyACM0" in line
-            for key, label in app.key_hints():
-                assert f" {key}  {label} " in line
-        if width == 120:
-            assert "/dev/ttyACM0" in line
-        shown = [label for label in labels if f" {label} " in line]
-        if shown and shown != labels:
-            # Hints are dropped from the end, and Help stands in for them
-            assert shown[-1] == "Help"
-            assert shown[:-1] == labels[: len(shown) - 1]
-        if width == 80:
-            assert shown and shown[-1] == "Help" and len(shown) < len(labels)
+        for width in (200, 120, 80, 40):
+            await pilot.resize_terminal(width, 24)
+            await pilot.pause()
+            assert bar.size.width == width
+            text = bar.render()
+            line = text.plain
+            assert text.cell_len <= width, width
+            assert line.rstrip().endswith("3D Fix  DGPS"), width  # the status, intact, right
+            if badges:
+                assert " REC " in line and " HOLD " in line, width  # badges beat hints
+            if width == 200:
+                assert "2GP+1GA/7sv /dev/ttyACM0" in line
+                for key, label in app.key_hints():
+                    assert f" {key}  {label} " in line
+            if width == 120:
+                assert "/dev/ttyACM0" in line
+            shown = [label for label in labels if f" {label} " in line]
+            if shown and shown != labels:
+                # Hints are dropped from the end, and Help stands in for them
+                assert shown[-1] == "Help", width
+                assert shown[:-1] == labels[: len(shown) - 1], width
+            if width == 80:
+                assert shown and shown[-1] == "Help" and len(shown) < len(labels)
 
 
 async def test_status_bar_drops_badge_counts_before_status():
@@ -170,3 +171,7 @@ async def test_status_bar_drops_badge_counts_before_status():
         assert text.cell_len <= bar.size.width
         assert "DISCONNECTED" in text.plain and "REC" in text.plain
         assert "123456" not in text.plain  # counts went first
+        await pilot.resize_terminal(18, 5)  # then the badges themselves
+        await pilot.pause()
+        text = bar.render()
+        assert text.plain.strip() == "DISCONNECTED" and text.cell_len <= 18

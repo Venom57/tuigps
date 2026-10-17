@@ -15,6 +15,7 @@ dev = [
     "pytest>=8",
     "pytest-asyncio>=0.23",
     "pytest-cov>=5",
+    "pytest-xdist>=3",
 ]
 
 [project.scripts]
@@ -33,6 +34,9 @@ include = ["src/tuigps"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# Run the tests in parallel (pytest-xdist): the Pilot tests are CPU-bound.
+# Use -n0 for a single serial process (e.g. with pdb or to see print output).
+addopts = "-n auto"
 markers = [
     "live_gpsd: run the real gpsd client thread in app tests",
 ]

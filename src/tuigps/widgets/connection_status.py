@@ -72,13 +72,6 @@ class ConnectionStatus(Static):
         self._hints = [hint_text(k, label) for k, label in (hints or [])]
         self._help_hint = hint_text(*help_hint) if help_hint else None
 
-    def set_hints(
-        self, hints: list[tuple[str, str]], help_hint: tuple[str, str] | None = None
-    ) -> None:
-        self._hints = [hint_text(k, label) for k, label in hints]
-        self._help_hint = hint_text(*help_hint) if help_hint else None
-        self.refresh()
-
     def update_gps_data(self, data: GPSData) -> None:
         if data is self._data:
             return  # same immutable snapshot: nothing new to draw
