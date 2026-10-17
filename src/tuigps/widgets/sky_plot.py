@@ -64,22 +64,19 @@ class _Background:
                     buf[y][x] = "."
                     keys[y][x] = GRID_KEY
 
-        # Crosshairs
-        if 0 <= cy < h:
-            for x in range(cx - max_rx, cx + max_rx + 1):
-                if 0 <= x < w and buf[cy][x] == " ":
-                    buf[cy][x] = "-"
-                    keys[cy][x] = GRID_KEY
-        if 0 <= cx < w:
-            for y in range(cy - max_ry, cy + max_ry + 1):
-                if 0 <= y < h and buf[y][cx] == " ":
-                    buf[y][cx] = "|"
-                    keys[y][cx] = GRID_KEY
+        # Crosshairs (w, h >= 1, so the center cell is always inside the plot)
+        for x in range(cx - max_rx, cx + max_rx + 1):
+            if 0 <= x < w and buf[cy][x] == " ":
+                buf[cy][x] = "-"
+                keys[cy][x] = GRID_KEY
+        for y in range(cy - max_ry, cy + max_ry + 1):
+            if 0 <= y < h and buf[y][cx] == " ":
+                buf[y][cx] = "|"
+                keys[y][cx] = GRID_KEY
 
         # Center: zenith marker
-        if 0 <= cy < h and 0 <= cx < w:
-            buf[cy][cx] = "+"
-            keys[cy][cx] = DEFAULT_KEY
+        buf[cy][cx] = "+"
+        keys[cy][cx] = DEFAULT_KEY
 
         # Cardinal direction labels
         for label, lx, ly in (

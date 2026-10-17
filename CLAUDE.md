@@ -22,6 +22,7 @@ Terminal UI GPS monitoring tool using gpsd.
 ## Key Patterns
 - All GPS data flows through a single `GPSData` dataclass
 - Widgets implement `update_gps_data(data: GPSData)` and override `render() -> Text`
+- Only the active tab's widgets (`TAB_WIDGETS` in `app.py`, references cached after mount) plus the status bar are refreshed; a tab is refreshed when activated. Widgets skip `refresh()` when handed the snapshot they already show (`data is self._data`), so display settings must be reactive (or call `refresh()`) to repaint
 - NaN values are used for unavailable data; always check `math.isfinite()` before display
 - The gpsd client runs in a daemon thread with auto-reconnect (exponential backoff 2s → 30s); `GPSData.connection_state` is "connecting" | "connected" | "disconnected", and `on_error` fires once per outage
 - The client mutates a private working `GPSData` and publishes shallow-copy snapshots to `on_update`; it always replaces nested objects/lists, never mutates them in place, so snapshots never change after publication

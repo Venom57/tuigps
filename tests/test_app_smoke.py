@@ -744,3 +744,24 @@ async def test_nmea_is_delivered_in_batches(monkeypatch):
         log = viewer.query_one("#nmea-log", RichLog)
         assert len(log.lines) == 300
         assert viewer.query_one("#nmea-stats").render().plain.startswith("300 sentences")
+
+
+async def test_failing_ui_callback_is_logged(caplog):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        def boom():
+            raise RuntimeError("callback exploded")
+
+        app._run_ui_callback(boom, ())
+        await pilot.pause()
+        assert app.is_running
+    assert any("UI callback failed" in r.getMessage() and r.exc_info for r in caplog.records)
+    # After shutdown, scheduled callbacks are dropped without running
+    app._run_ui_callback(boom, ())
+
+
+def test_refresh_before_mount_is_a_no_op(make_gps_data):
+    app = TuiGPS()
+    app._gps_data = make_gps_data()
+    app._refresh_ui()
+    app._deliver_nmea_batch(["$GPGGA,1*00"])
