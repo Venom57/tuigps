@@ -62,13 +62,22 @@ class TestFmtCoord:
     def test_non_finite(self, value, style):
         assert fmt_coord(value, "lat", style) == "---"
 
-    @pytest.mark.xfail(
-        strict=True,
-        reason="New finding N4 (not in plan): DMS/DDM rounding can produce 60 seconds/minutes",
-    )
     def test_dms_rounding_never_shows_60_seconds(self):
-        assert "60.00" not in fmt_coord(10.9999999, "lat", "dms")
-        assert "60.00000" not in fmt_coord(10.99999999, "lat", "ddm")
+        """N4: rounding carries into minutes and degrees."""
+        assert fmt_coord(10.9999999, "lat", "dms") == "11\u00b000'00.00\"N"
+        assert fmt_coord(10.99999999, "lat", "ddm") == "11\u00b000.00000'N"
+        # 10°59'59.999" -> carries into the minute
+        assert fmt_coord(10 + 30 / 60 + 59.999 / 3600, "lat", "dms") == "10\u00b031'00.00\"N"
+        assert fmt_coord(-(10 + 59.9999999 / 60), "lon", "ddm") == "11\u00b000.00000'W"
+
+    def test_dms_ddm_fields_in_range(self):
+        for i in range(2000):
+            value = i * 0.0123457 + 1e-9 * (i % 7)
+            dms = fmt_coord(value, "lat", "dms")
+            minutes, seconds = dms.split("\u00b0")[1].split("'")
+            assert 0 <= int(minutes) < 60 and 0 <= float(seconds.rstrip('"N')) < 60, dms
+            ddm = fmt_coord(value, "lat", "ddm")
+            assert 0 <= float(ddm.split("\u00b0")[1].rstrip("'N")) < 60, ddm
 
 
 class TestFmtSpeed:

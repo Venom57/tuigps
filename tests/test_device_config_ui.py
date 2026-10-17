@@ -82,37 +82,58 @@ async def test_select_buttons(ubx_calls):
     assert ubx_calls == [expected for *_, expected in SELECT_BUTTONS]
 
 
-def test_select_blank_sentinel_characterization():
-    """``Select.BLANK`` no longer exists in Textual 8; it resolves to ``Widget.BLANK``
-    (False), so the ``is not Select.BLANK`` guards in DeviceConfig never trigger."""
+def test_select_blank_sentinel():
+    """``Select.BLANK`` no longer exists in Textual 8 (it resolves to ``Widget.BLANK``,
+    False); "nothing selected" is ``Select.NULL``, which DeviceConfig checks."""
     assert Select.BLANK is False
     assert Select.BLANK is not Select.NULL
+    assert Select([("a", 1)]).value is Select.NULL
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="New finding N6 (not in plan): Select.BLANK guard is wrong on Textual 8 "
-    "(Select.NULL), so an unselected 'Set' sends '-p MODEL,Select.NULL' to ubxtool",
-)
 async def test_select_buttons_without_selection_do_nothing(ubx_calls):
+    """N6: an unselected 'Set' sends nothing and asks for a selection."""
     app = Harness()
     async with app.run_test(size=(140, 50)) as pilot:
         w = app.query_one(DeviceConfig)
         for btn_id in ("btn-model", "btn-rate", "btn-power"):
             await press(pilot, w, btn_id)
+        assert log_text(w).count("Select a value first") == 3
     assert ubx_calls == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="New finding N6 (not in plan): baud 'Set' with no selection does int(Select.NULL) "
-    "and the TypeError crashes the app",
-)
-async def test_baud_button_without_selection_does_not_crash(monkeypatch):
-    monkeypatch.setattr(DeviceConfig, "_set_baud_rate", lambda self, speed: None)
+async def test_select_value_zero_is_a_selection(ubx_calls):
+    """Model 0 (Portable) / power 0 (Full Power) are valid values, not 'nothing'."""
     app = Harness()
     async with app.run_test(size=(140, 50)) as pilot:
-        await press(pilot, app.query_one(DeviceConfig), "btn-baud")
+        w = app.query_one(DeviceConfig)
+        w.query_one("#sel-model", Select).value = 0
+        w.query_one("#sel-power", Select).value = 0
+        await press(pilot, w, "btn-model")
+        await press(pilot, w, "btn-power")
+    assert ubx_calls == ["-p MODEL,0", "-p PMS,0"]
+
+
+async def test_baud_button_without_selection_does_not_crash(monkeypatch):
+    """N6: baud 'Set' with no selection used to crash on int(Select.NULL)."""
+    speeds = []
+    monkeypatch.setattr(DeviceConfig, "_set_baud_rate", lambda self, speed: speeds.append(speed))
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        await press(pilot, w, "btn-baud")
+        assert "Select a value first" in log_text(w)
+        assert app.is_running
+    assert speeds == []
+
+
+async def test_pps_apply_without_selection_uses_defaults(ubx_calls):
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.query_one("#sel-pps-freq", Select).clear()
+        w.query_one("#sel-pps-dur", Select).clear()
+        await press(pilot, w, "btn-pps-apply")
+    assert ubx_calls == ["-c " + w._build_tp5_cmd(1, 100000, True)]
 
 
 async def test_pps_apply_and_disable(ubx_calls):
@@ -237,8 +258,8 @@ async def test_run_ubxtool_not_installed(monkeypatch):
         assert await wait_for(pilot, lambda: "ubxtool not found" in log_text(w))
 
 
-@pytest.mark.xfail(strict=True, reason="F9: ubxtool args are split with str.split() instead of shlex.split()")
 async def test_run_ubxtool_respects_quotes(monkeypatch):
+    """F9: arguments are split with shlex."""
     calls = []
 
     def fake_run(cmd, **kwargs):
@@ -252,6 +273,20 @@ async def test_run_ubxtool_respects_quotes(monkeypatch):
         w._run_ubxtool('-x "A B"')
         assert await wait_for(pilot, lambda: bool(calls))
     assert calls[0] == ["ubxtool", "-P", "18", "-x", "A B"]
+
+
+async def test_run_ubxtool_bad_quoting(monkeypatch):
+    calls = []
+    monkeypatch.setattr(dc.subprocess, "run", lambda cmd, **kw: calls.append(cmd))
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.query_one("#input-cmd", Input).value = '-x "unterminated'
+        await press(pilot, w, "btn-run-cmd")
+        await pilot.pause(0.05)
+        assert "Error: invalid arguments" in log_text(w)
+        assert app.is_running
+    assert calls == []
 
 
 async def test_set_baud_rate(make_gps_data, monkeypatch):

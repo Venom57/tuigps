@@ -31,15 +31,17 @@ def fmt_coord(value: float, axis: str = "lat", style: str = "dd") -> str:
     if style == "dd":
         return f"{abs_val:.6f}\u00b0 {direction}"
     elif style == "dms":
-        degrees = int(abs_val)
-        minutes_full = (abs_val - degrees) * 60
-        minutes = int(minutes_full)
-        seconds = (minutes_full - minutes) * 60
-        return f"{degrees}\u00b0{minutes:02d}'{seconds:05.2f}\"{direction}"
+        # Round once, in integer hundredths of a second, so that rounding
+        # carries into minutes/degrees instead of showing 60.00 seconds.
+        total = round(abs_val * 360_000)
+        degrees, rem = divmod(total, 360_000)
+        minutes, hundredths = divmod(rem, 6_000)
+        return f"{degrees}\u00b0{minutes:02d}'{hundredths / 100:05.2f}\"{direction}"
     elif style == "ddm":
-        degrees = int(abs_val)
-        minutes = (abs_val - degrees) * 60
-        return f"{degrees}\u00b0{minutes:08.5f}'{direction}"
+        # Same, in units of 1e-5 minutes (never shows 60.00000 minutes)
+        total = round(abs_val * 6_000_000)
+        degrees, rem = divmod(total, 6_000_000)
+        return f"{degrees}\u00b0{rem / 100_000:08.5f}'{direction}"
     return f"{abs_val:.6f}\u00b0 {direction}"
 
 

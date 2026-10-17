@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import time
+import types
+from collections import deque
 
 import pytest
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.widgets import Button, RichLog
+from textual.widgets import Button, RichLog, Static
 
 from tuigps.data_model import GPSData, PPSData, SatelliteInfo
 from tuigps.position_hold import HoldResult
@@ -315,8 +317,8 @@ async def test_signal_chart_truncates_when_too_many():
         assert "... +" in plain
 
 
-@pytest.mark.xfail(strict=True, reason="F13: signal chart height budget counts skipped SNR-0 satellites")
 async def test_signal_chart_budget_ignores_skipped_satellites():
+    """F13: satellites without a signal are not rendered and use no rows."""
     chart = SignalChart()
     app = Harness(chart, height=8)
     async with app.run_test(size=(80, 20)):
@@ -326,6 +328,19 @@ async def test_signal_chart_budget_ignores_skipped_satellites():
         chart.update_gps_data(GPSData(satellites=sats))
         plain = chart.render().plain
         assert "GP20" in plain and "GP21" in plain
+        assert "more" not in plain
+
+
+async def test_signal_chart_more_counts_only_drawable_satellites():
+    chart = SignalChart()
+    app = Harness(chart, height=8)
+    async with app.run_test(size=(80, 20)):
+        sats = [SatelliteInfo(gnssid=0, svid=i, snr=40.0 - i, used=True) for i in range(1, 11)]
+        sats += [SatelliteInfo(gnssid=0, svid=50 + i, snr=float("nan")) for i in range(5)]
+        chart.update_gps_data(GPSData(satellites=sats))
+        plain = chart.render().plain
+        rows = sum(1 for line in plain.splitlines() if line.startswith("\u2022GP"))
+        assert f"... +{10 - rows} more" in plain
 
 
 # ─── NMEA viewer ────────────────────────────────────────────────────────
@@ -340,6 +355,10 @@ def test_sentence_type(sentence, expected):
 
 
 SENTENCES = ["$GPGGA,a*00", "$GPRMC,b*00", "$GPGSV,c*00"]
+
+
+def _log_lines(log) -> list[str]:
+    return ["".join(seg.text for seg in strip).rstrip() for strip in log.lines]
 
 
 async def _press(pilot, viewer, btn_id):
@@ -357,21 +376,26 @@ async def test_nmea_viewer_append_filter_clear():
         await pilot.pause()
         assert len(log.lines) == 3
 
+        # F7: changing the filter re-filters the existing lines
         await _press(pilot, viewer, "btn-nmea-gga")
         assert viewer._filter == "GGA"
         assert viewer.query_one("#btn-nmea-gga", Button).variant == "primary"
         assert viewer.query_one("#btn-nmea-all", Button).variant == "default"
+        assert _log_lines(log) == ["$GPGGA,a*00"]
         viewer.append_nmea("$GPRMC,d*00")
         viewer.append_nmea("$GPGGA,e*00")
         await pilot.pause()
-        assert len(log.lines) == 4
+        assert _log_lines(log) == ["$GPGGA,a*00", "$GPGGA,e*00"]
+        assert "GGA: 2" in viewer.stats_text()
 
         await _press(pilot, viewer, "btn-nmea-all")
         assert viewer._filter == ""
+        assert _log_lines(log) == SENTENCES + ["$GPRMC,d*00", "$GPGGA,e*00"]
 
         await _press(pilot, viewer, "btn-nmea-clear")
         assert len(log.lines) == 0
         assert len(viewer._buffer) == 0
+        assert viewer.stats_text().startswith("0 sentences")
 
 
 async def test_nmea_viewer_pause_buffers():
@@ -390,8 +414,8 @@ async def test_nmea_viewer_pause_buffers():
         assert len(log.lines) == 1
 
 
-@pytest.mark.xfail(strict=True, reason="F7: resuming after pause re-writes the whole buffer (duplicates)")
 async def test_nmea_viewer_resume_does_not_duplicate():
+    """F7: resume writes only the sentences received while paused."""
     viewer = NMEAViewer()
     app = Harness(viewer)
     async with app.run_test(size=(120, 30)) as pilot:
@@ -400,5 +424,57 @@ async def test_nmea_viewer_resume_does_not_duplicate():
             viewer.append_nmea(s)
         await _press(pilot, viewer, "btn-nmea-pause")
         viewer.append_nmea("$GPVTG,z*00")
+        assert "PAUSED (1 buffered)" in viewer.stats_text()
         await _press(pilot, viewer, "btn-nmea-pause")
-        assert len(log.lines) == 4
+        assert _log_lines(log) == SENTENCES + ["$GPVTG,z*00"]
+        assert "PAUSED" not in viewer.stats_text()
+
+
+async def test_nmea_viewer_filter_change_while_paused():
+    """Re-filtering while paused shows only already-shown sentences; resume adds the rest once."""
+    viewer = NMEAViewer()
+    app = Harness(viewer)
+    async with app.run_test(size=(120, 30)) as pilot:
+        log = viewer.query_one("#nmea-log", RichLog)
+        for s in SENTENCES:
+            viewer.append_nmea(s)
+        await _press(pilot, viewer, "btn-nmea-pause")
+        viewer.append_nmea("$GPGGA,p*00")
+        await _press(pilot, viewer, "btn-nmea-gga")
+        assert _log_lines(log) == ["$GPGGA,a*00"]
+        await _press(pilot, viewer, "btn-nmea-pause")
+        assert _log_lines(log) == ["$GPGGA,a*00", "$GPGGA,p*00"]
+
+
+async def test_nmea_viewer_pause_overflow_keeps_latest():
+    viewer = NMEAViewer()
+    viewer._buffer = deque(maxlen=5)
+    app = Harness(viewer)
+    async with app.run_test(size=(120, 30)) as pilot:
+        log = viewer.query_one("#nmea-log", RichLog)
+        viewer.append_nmea("$GPGGA,0*00")
+        await _press(pilot, viewer, "btn-nmea-pause")
+        for i in range(1, 9):
+            viewer.append_nmea(f"$GPGGA,{i}*00")
+        assert viewer._pending == 5
+        await _press(pilot, viewer, "btn-nmea-pause")
+        assert _log_lines(log) == ["$GPGGA,0*00"] + [f"$GPGGA,{i}*00" for i in range(4, 9)]
+
+
+async def test_nmea_viewer_stats(monkeypatch):
+    """F7: #nmea-stats shows the total and the per-second rate."""
+    from tuigps.widgets import nmea_viewer
+
+    now = {"t": 100.0}
+    monkeypatch.setattr(nmea_viewer, "time", types.SimpleNamespace(monotonic=lambda: now["t"]))
+    viewer = NMEAViewer()
+    app = Harness(viewer)
+    async with app.run_test(size=(160, 30)) as pilot:
+        for i in range(10):
+            now["t"] = 100.0 + i * 0.5
+            viewer.append_nmea(SENTENCES[i % 3])
+        await pilot.pause()
+        stats = viewer.query_one("#nmea-stats", Static)
+        assert str(stats.render()) == "10 sentences  2.0/s"
+        now["t"] = 200.0
+        assert viewer.stats_text() == "10 sentences  0.0/s"

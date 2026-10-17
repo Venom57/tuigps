@@ -413,3 +413,38 @@ def test_hold_and_log_follow_client_tpv_epochs(fake_session, tpv_session, tmp_pa
     assert app._hold.fix_count == 2
     assert app._gps_logger.fix_count == 2
 
+
+
+async def test_failing_widget_update_is_logged_not_fatal(make_gps_data, monkeypatch, caplog):
+    """F15: one broken widget is logged and does not stop the other updates."""
+    from tuigps.widgets.fix_panel import FixPanel
+
+    def boom(self, data):
+        raise RuntimeError("fix panel exploded")
+
+    monkeypatch.setattr(FixPanel, "update_gps_data", boom)
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        await pilot.pause()
+        assert app.is_running
+        # Widgets after the failing one were still updated
+        assert "/dev/ttyACM0" in app.query_one("#w-device-detail").render().plain
+    assert any("#w-fix" in r.getMessage() and r.exc_info for r in caplog.records)
+
+
+async def test_refresh_with_modal_open_is_silent(make_gps_data, caplog):
+    """Widgets are not queryable while a modal is active: NoMatches is expected, not logged."""
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("s")
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        app._deliver_nmea("$GPGGA,1*00")
+        app._deliver_clock_result("System clock set to: x")
+        await pilot.pause()
+        assert app.is_running
+    assert not [r for r in caplog.records if r.name.startswith("tuigps")]

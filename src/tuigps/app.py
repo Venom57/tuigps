@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import webbrowser
+from contextlib import contextmanager
 
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Grid, Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widgets import Button, Header, TabbedContent, TabPane
 
 from .clock_sync import set_clock_from_gps
@@ -29,6 +32,8 @@ from .widgets.signal_chart import SignalChart
 from .widgets.sky_plot import SkyPlot
 from .widgets.time_panel import TimePanel
 from .widgets.velocity_panel import VelocityPanel
+
+log = logging.getLogger(__name__)
 
 
 class TuiGPS(App):
@@ -154,27 +159,35 @@ class TuiGPS(App):
         """Called from the gpsd thread on connection errors."""
         try:
             self.call_from_thread(self.notify, f"gpsd: {error}", severity="error", timeout=5)
-        except Exception:
-            pass
+        except RuntimeError:
+            pass  # app not running (startup/shutdown)
 
     def _on_nmea(self, sentence: str) -> None:
         """Called from the gpsd thread with raw NMEA sentences."""
         try:
             self.call_from_thread(self._deliver_nmea, sentence)
+        except RuntimeError:
+            pass  # app not running (startup/shutdown)
+
+    @contextmanager
+    def _ui_guard(self, what: str):
+        """Keep one failing widget update from crashing the app or the refresh."""
+        try:
+            yield
+        except NoMatches:
+            pass  # widget not on the active screen (e.g. a modal is open)
         except Exception:
-            pass
+            log.exception("UI update failed: %s", what)
 
     def _deliver_clock_result(self, message: str) -> None:
         """Show clock sync result in Device tab output and as notification."""
-        try:
+        with self._ui_guard("clock result"):
             config = self.query_one("#w-device-config", DeviceConfig)
             config._append_output(message)
             # Reset the arm button
             btn = config.query_one("#btn-arm-clock", Button)
             btn.variant = "warning"
             btn.label = "Arm Clock Sync"
-        except Exception:
-            pass
         is_error = message.startswith("Error")
         self.notify(
             message.split("\n")[0],
@@ -184,45 +197,37 @@ class TuiGPS(App):
 
     def _deliver_nmea(self, sentence: str) -> None:
         """Deliver NMEA sentence to the viewer widget (on Textual thread)."""
-        try:
+        with self._ui_guard("#w-nmea"):
             viewer = self.query_one("#w-nmea", NMEAViewer)
             viewer.append_nmea(sentence)
-        except Exception:
-            pass
 
     def _refresh_ui(self) -> None:
         """Push current GPS data to all widgets."""
         # Pass hold data to position panel
-        try:
+        with self._ui_guard("#w-position"):
             pos = self.query_one("#w-position", PositionPanel)
             pos.units = self._units
             pos.coord_format = self._coord_format
             pos.set_hold_data(self._hold.result if self._hold.is_active else None)
             pos.update_gps_data(self._gps_data)
-        except Exception:
-            pass
 
         # Pass logging/hold state to connection status
-        try:
+        with self._ui_guard("#w-connection"):
             conn = self.query_one("#w-connection", ConnectionStatus)
             conn.logging_active = self._gps_logger.is_active
             conn.log_count = self._gps_logger.fix_count
             conn.hold_active = self._hold.is_active
             conn.hold_count = self._hold.fix_count
             conn.update_gps_data(self._gps_data)
-        except Exception:
-            pass
 
         # Check if armed TOFF fired (single-shot)
         if not self._gpsd.toff_armed and math.isfinite(self._gps_data.toff_armed_offset):
-            try:
+            with self._ui_guard("#btn-arm-toff"):
                 btn = self.query_one("#btn-arm-toff", Button)
                 if btn.variant == "success":
                     offset_ms = self._gps_data.toff_armed_offset * 1000
                     btn.variant = "warning"
                     btn.label = f"Arm TOFF (delta: {offset_ms:+.1f} ms)"
-            except Exception:
-                pass
 
         widget_ids = [
             "w-fix", "w-velocity", "w-skyplot", "w-signal",
@@ -231,7 +236,7 @@ class TuiGPS(App):
             "w-device-config",
         ]
         for wid in widget_ids:
-            try:
+            with self._ui_guard(f"#{wid}"):
                 widget = self.query_one(f"#{wid}")
                 if hasattr(widget, "units"):
                     widget.units = self._units
@@ -239,8 +244,6 @@ class TuiGPS(App):
                     widget.coord_format = self._coord_format
                 if hasattr(widget, "update_gps_data"):
                     widget.update_gps_data(self._gps_data)
-            except Exception:
-                pass
 
     def _heartbeat(self) -> None:
         """Periodic refresh for staleness detection and clock updates."""
@@ -260,12 +263,10 @@ class TuiGPS(App):
         self._gps_data.toff_armed_gps_time = ""
         self._gps_data.toff_armed_sys_time = 0.0
         self._gpsd.toff_armed = True
-        try:
+        with self._ui_guard("#btn-arm-toff"):
             btn = self.query_one("#btn-arm-toff", Button)
             btn.variant = "success"
             btn.label = "ARMED — waiting..."
-        except Exception:
-            pass
         self.notify("TOFF armed — waiting for next GPS message", timeout=2)
 
     def _clear_toff(self) -> None:
@@ -276,12 +277,10 @@ class TuiGPS(App):
         self._gps_data.toff_armed_offset = float("nan")
         self._gps_data.toff_armed_gps_time = ""
         self._gps_data.toff_armed_sys_time = 0.0
-        try:
+        with self._ui_guard("#btn-arm-toff"):
             btn = self.query_one("#btn-arm-toff", Button)
             btn.variant = "warning"
             btn.label = "Arm TOFF"
-        except Exception:
-            pass
         self._refresh_ui()
 
     # ─── Actions ─────────────────────────────────────────────

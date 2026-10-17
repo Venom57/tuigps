@@ -6,6 +6,7 @@ import ctypes
 import fcntl
 import glob
 import os
+import shlex
 import struct
 import subprocess
 import threading
@@ -14,6 +15,7 @@ from datetime import datetime, timezone
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.css.query import NoMatches
 from textual.widgets import Button, Input, Label, RichLog, Select
 
 from ..clock_sync import set_clock_from_gps
@@ -247,28 +249,28 @@ class DeviceConfig(Vertical):
             return
 
         if btn_id == "btn-model":
-            sel = self.query_one("#sel-model", Select)
-            if sel.value is not Select.BLANK:
-                self._run_ubxtool(f"-p MODEL,{sel.value}")
+            value = self._selected("#sel-model")
+            if value is not None:
+                self._run_ubxtool(f"-p MODEL,{value}")
         elif btn_id == "btn-rate":
-            sel = self.query_one("#sel-rate", Select)
-            if sel.value is not Select.BLANK:
-                self._run_ubxtool(f"-p CFG-RATE,{sel.value}")
+            value = self._selected("#sel-rate")
+            if value is not None:
+                self._run_ubxtool(f"-p CFG-RATE,{value}")
         elif btn_id == "btn-power":
-            sel = self.query_one("#sel-power", Select)
-            if sel.value is not Select.BLANK:
-                self._run_ubxtool(f"-p PMS,{sel.value}")
+            value = self._selected("#sel-power")
+            if value is not None:
+                self._run_ubxtool(f"-p PMS,{value}")
         elif btn_id == "btn-baud":
-            sel = self.query_one("#sel-baud", Select)
-            if sel.value is not Select.BLANK:
-                self._set_baud_rate(int(sel.value))
+            value = self._selected("#sel-baud")
+            if value is not None:
+                self._set_baud_rate(int(value))
         elif btn_id == "btn-baud-read":
             self._run_ubxtool("-p CFG-PRT")
         elif btn_id == "btn-pps-apply":
             freq_sel = self.query_one("#sel-pps-freq", Select)
             dur_sel = self.query_one("#sel-pps-dur", Select)
-            freq = freq_sel.value if freq_sel.value is not Select.BLANK else 1
-            dur = dur_sel.value if dur_sel.value is not Select.BLANK else 100000
+            freq = freq_sel.value if freq_sel.value is not Select.NULL else 1
+            dur = dur_sel.value if dur_sel.value is not Select.NULL else 100000
             self._send_tp5(freq_hz=int(freq), pulse_us=int(dur), active=True)
         elif btn_id == "btn-pps-disable":
             self._send_tp5(freq_hz=0, pulse_us=0, active=False)
@@ -305,17 +307,23 @@ class DeviceConfig(Vertical):
                 self._gnss_enabled[gnss] = True
             self._update_gnss_buttons()
 
+    def _selected(self, select_id: str):
+        """Return a Select's value, or None (with a hint) when nothing is selected."""
+        value = self.query_one(select_id, Select).value
+        if value is Select.NULL:
+            self._append_output("Select a value first")
+            self.app.notify("Select a value first", severity="warning", timeout=2)
+            return None
+        return value
+
     def _update_gnss_buttons(self) -> None:
         """Update GNSS button styles to reflect enabled/disabled state."""
         for gnss in CONSTELLATIONS:
             try:
                 btn = self.query_one(f"#btn-gnss-{gnss.lower()}", Button)
-                if self._gnss_enabled.get(gnss, False):
-                    btn.variant = "success"
-                else:
-                    btn.variant = "default"
-            except Exception:
-                pass
+            except NoMatches:
+                continue
+            btn.variant = "success" if self._gnss_enabled.get(gnss, False) else "default"
 
     def _arm_clock_sync(self) -> None:
         """Arm clock sync — fires on the gpsd thread when the next fix arrives.
@@ -327,21 +335,15 @@ class DeviceConfig(Vertical):
             # Already armed, disarm
             self.app._armed_clock_set = False
             self._append_output("Clock sync disarmed")
-            try:
-                btn = self.query_one("#btn-arm-clock", Button)
-                btn.variant = "warning"
-                btn.label = "Arm Clock Sync"
-            except Exception:
-                pass
+            btn = self.query_one("#btn-arm-clock", Button)
+            btn.variant = "warning"
+            btn.label = "Arm Clock Sync"
         else:
             self.app._armed_clock_set = True
             self._append_output("Clock sync ARMED — will fire on next GPS update")
-            try:
-                btn = self.query_one("#btn-arm-clock", Button)
-                btn.variant = "success"
-                btn.label = "ARMED (click to cancel)"
-            except Exception:
-                pass
+            btn = self.query_one("#btn-arm-clock", Button)
+            btn.variant = "success"
+            btn.label = "ARMED (click to cancel)"
 
     def _set_system_clock(self) -> None:
         """Set the system clock immediately from current GPS time."""
@@ -604,11 +606,16 @@ class DeviceConfig(Vertical):
         """Run ubxtool in a background thread."""
         cmd_str = f"ubxtool -P {self._proto_ver} {args}"
         self._append_output(f"$ {cmd_str}")
+        try:
+            argv = shlex.split(args)
+        except ValueError as e:
+            self._append_output(f"Error: invalid arguments ({e}); check quoting")
+            return
 
         def run():
             try:
                 result = subprocess.run(
-                    ["ubxtool", "-P", self._proto_ver] + args.split(),
+                    ["ubxtool", "-P", self._proto_ver] + argv,
                     capture_output=True,
                     text=True,
                     timeout=10,
@@ -634,7 +641,7 @@ class DeviceConfig(Vertical):
         """Add text to the output log."""
         try:
             output = self.query_one("#config-output", RichLog)
-            for line in text.split("\n"):
-                output.write(line)
-        except Exception:
-            pass
+        except NoMatches:
+            return  # not mounted (e.g. result delivered during shutdown)
+        for line in text.split("\n"):
+            output.write(line)

@@ -5,6 +5,7 @@ from __future__ import annotations
 from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal, Vertical
+from textual.css.query import NoMatches
 from textual.screen import ModalScreen
 from textual.widgets import Button, Checkbox, Input, Label, Select
 
@@ -97,10 +98,10 @@ class SettingsScreen(ModalScreen[dict | None]):
             for _, key, _ in CONSTELLATIONS:
                 try:
                     chk = self.query_one(f"#chk-gnss-{key}", Checkbox)
-                    if chk.value:
-                        enabled.add(key)
-                except Exception:
-                    pass
+                except NoMatches:
+                    continue
+                if chk.value:
+                    enabled.add(key)
 
             result = {
                 "host": self.query_one("#input-host", Input).value,

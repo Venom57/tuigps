@@ -39,10 +39,11 @@ class SignalChart(Static):
             txt.append("  No satellites\n", style="dim")
             return txt
 
-        # Sort: used first, then by SNR descending
+        # Only satellites with a signal get a row, so only they count against
+        # the height budget. Sort: used first, then by SNR descending.
         sats = sorted(
-            self._data.satellites,
-            key=lambda s: (not s.used, -(s.snr if math.isfinite(s.snr) else 0)),
+            (s for s in self._data.satellites if math.isfinite(s.snr) and s.snr > 0),
+            key=lambda s: (not s.used, -s.snr),
         )
 
         max_snr = 55.0  # typical max dBHz for bar scaling
@@ -55,9 +56,6 @@ class SignalChart(Static):
                 if remaining > 0:
                     txt.append(f"  ... +{remaining} more\n", style="dim")
                 break
-
-            if not math.isfinite(sat.snr) or sat.snr <= 0:
-                continue
 
             prefix = GNSS_SHORT.get(sat.gnssid, "??")
             label = f"{prefix}{sat.svid:02d}"
