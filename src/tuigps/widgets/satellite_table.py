@@ -35,7 +35,9 @@ class SatelliteTable(Static):
         txt.append("Satellite Details\n", style="bold")
 
         # Header
-        header = f"{'GNSS':<6} {'PRN':>4} {'SV':>3} {'El\u00b0':>5} {'Az\u00b0':>5} {'SNR':>5} {'Used':>5} {'Sig':>4} {'Hlth':>5}"
+        # No backslash escapes inside f-string expressions (SyntaxError before 3.12)
+        el, az = "El\u00b0", "Az\u00b0"
+        header = f"{'GNSS':<6} {'PRN':>4} {'SV':>3} {el:>5} {az:>5} {'SNR':>5} {'Used':>5} {'Sig':>4} {'Hlth':>5}"
         txt.append(header + "\n", style="bold bright_white")
         txt.append("\u2500" * len(header) + "\n", style="bright_black")
 

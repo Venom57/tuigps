@@ -18,6 +18,7 @@ from .data_model import (
     TOFFData,
     VersionInfo,
 )
+from .timeutil import parse_gps_time
 
 # The python3-gps package is a system apt package, not on PyPI.
 # When running in a venv it may not be on sys.path.
@@ -236,45 +237,34 @@ class GPSDClient:
         # Compute TOFF: GPS time vs system clock (captured at message receipt)
         # gpsd only sends TOFF messages with PPS hardware; we compute it here
         # so it always works when there's a GPS time in the TPV.
-        if d.time and self._receipt_time > 0:
-            try:
-                from datetime import datetime, timezone
+        gps_epoch = parse_gps_time(d.time) if d.time else None
+        if gps_epoch is not None and self._receipt_time > 0:
+            sys_epoch = self._receipt_time  # precise: captured right after s.read()
 
-                ts = d.time.replace("T", " ").replace("Z", "")
-                if "." in ts:
-                    gps_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f")
-                else:
-                    gps_dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                gps_dt = gps_dt.replace(tzinfo=timezone.utc)
-                gps_epoch = gps_dt.timestamp()
-                sys_epoch = self._receipt_time  # precise: captured right after s.read()
+            # Current TOFF for display
+            gps_sec = int(gps_epoch)
+            gps_nsec = (gps_epoch - gps_sec) * 1e9
+            sys_sec = int(sys_epoch)
+            sys_nsec = (sys_epoch - sys_sec) * 1e9
 
-                # Current TOFF for display
-                gps_sec = int(gps_epoch)
-                gps_nsec = (gps_epoch - gps_sec) * 1e9
-                sys_sec = int(sys_epoch)
-                sys_nsec = (sys_epoch - sys_sec) * 1e9
+            d.toff = TOFFData(
+                real_sec=float(gps_sec),
+                real_nsec=gps_nsec,
+                clock_sec=float(sys_sec),
+                clock_nsec=sys_nsec,
+            )
 
-                d.toff = TOFFData(
-                    real_sec=float(gps_sec),
-                    real_nsec=gps_nsec,
-                    clock_sec=float(sys_sec),
-                    clock_nsec=sys_nsec,
-                )
+            # Accumulate TOFF sample (offset in seconds)
+            offset = gps_epoch - sys_epoch
+            self._toff_buffer.append(offset)
+            d.toff_samples = list(self._toff_buffer)
 
-                # Accumulate TOFF sample (offset in seconds)
-                offset = gps_epoch - sys_epoch
-                self._toff_buffer.append(offset)
-                d.toff_samples = list(self._toff_buffer)
-
-                # Armed mode: single-shot on next TPV with GPS time
-                if self.toff_armed:
-                    self.toff_armed = False
-                    d.toff_armed_offset = offset
-                    d.toff_armed_gps_time = d.time
-                    d.toff_armed_sys_time = sys_epoch
-            except Exception:
-                pass
+            # Armed mode: single-shot on next TPV with GPS time
+            if self.toff_armed:
+                self.toff_armed = False
+                d.toff_armed_offset = offset
+                d.toff_armed_gps_time = d.time
+                d.toff_armed_sys_time = sys_epoch
 
     def _extract_sky(self, s, d: GPSData) -> None:
         """Extract SKY (satellite) data."""

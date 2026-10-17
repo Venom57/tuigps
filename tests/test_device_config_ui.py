@@ -271,3 +271,73 @@ async def test_set_baud_rate(make_gps_data, monkeypatch):
         ["ubxtool", "-P", "18", "-S", "115200"],
         ["gpsctl", "-s", "115200", "/dev/ttyACM0"],
     ]
+
+
+# ─── PPS clock sync (ioctl and commands mocked) ──────────────────────
+
+
+PPS_GPS_TIME = "2026-03-14T12:00:00.250Z"
+PPS_BASE = 1773489600  # 2026-03-14T12:00:00Z
+
+
+def _pps_setup(monkeypatch, results):
+    """Mock /dev/pps0, the PPS ioctl, the clock and subprocess.run."""
+    now = PPS_BASE + 10.0
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        rc, err = results.get(cmd[0], (0, ""))
+        return subprocess.CompletedProcess(cmd, rc, "", err)
+
+    monkeypatch.setattr(dc.subprocess, "run", fake_run)
+    monkeypatch.setattr(dc.glob, "glob", lambda pat: ["/dev/pps0"])
+    monkeypatch.setattr(dc, "time", type("T", (), {"time": staticmethod(lambda: now)}))
+    # Pulse marks GPS second PPS_BASE+1; kernel clock is 2 ms ahead at that edge
+    monkeypatch.setattr(
+        DeviceConfig, "_wait_for_pps",
+        staticmethod(lambda path, timeout_sec=3: (PPS_BASE + 1, 2_000_000, 7)),
+    )
+    # GPS time .250 received 0.7 s ago -> current GPS time ~ .950 -> target = +1 s
+    return calls, dict(time=PPS_GPS_TIME, last_seen=now - 0.7)
+
+
+async def test_pps_sync_applies_relative_offset(make_gps_data, monkeypatch):
+    calls, overrides = _pps_setup(monkeypatch, {})
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(**overrides))
+        await press(pilot, w, "btn-pps-sync")
+        assert await wait_for(pilot, lambda: "PPS-disciplined" in log_text(w))
+        out = log_text(w)
+    assert "PPS pulse #7" in out and "Clock offset: -2.000 ms" in out
+    assert calls[0] == ["timedatectl", "set-ntp", "false"]
+    assert calls[1][-4:] == ["xbb", "-2000", "true", "true"]
+
+
+async def test_pps_sync_failure_reports_each_command(make_gps_data, monkeypatch):
+    """N5: the final error labels busctl's and sudo's stderr correctly."""
+    calls, overrides = _pps_setup(
+        monkeypatch, {"busctl": (1, "busctl-err"), "sudo": (1, "sudo-err")},
+    )
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(**overrides))
+        await press(pilot, w, "btn-pps-sync")
+        assert await wait_for(pilot, lambda: "could not apply PPS offset" in log_text(w))
+        out = log_text(w)
+    assert "busctl: busctl-err" in out
+    assert "sudo: sudo-err" in out
+    assert calls[-1] == ["sudo", "-n", "date", "-u", "-s", "2026-03-14 12:00:01"]
+
+
+async def test_pps_sync_unparseable_time(make_gps_data, monkeypatch):
+    monkeypatch.setattr(dc.glob, "glob", lambda pat: ["/dev/pps0"])
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(time="garbage"))
+        await press(pilot, w, "btn-pps-sync")
+        assert "cannot parse GPS time 'garbage'" in log_text(w)

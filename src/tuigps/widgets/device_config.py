@@ -10,6 +10,7 @@ import struct
 import subprocess
 import threading
 import time
+from datetime import datetime, timezone
 
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
@@ -17,6 +18,7 @@ from textual.widgets import Button, Input, Label, RichLog, Select
 
 from ..clock_sync import set_clock_from_gps
 from ..data_model import GPSData
+from ..timeutil import parse_gps_time
 
 
 # ── Linux kernel PPS ioctl structures (from <linux/pps.h>) ──
@@ -46,12 +48,19 @@ class _PPSFData(ctypes.Structure):
     ]
 
 
+# pps_ktime.flags: timeout is invalid, i.e. wait forever. Leave it clear so the
+# kernel honours our timeout.
+_PPS_TIME_INVALID = 1 << 0
+
+
 def _iowr(type_char: str, nr: int, size: int) -> int:
-    """Compute _IOWR ioctl number (Linux x86_64)."""
+    """Compute _IOWR ioctl number (asm-generic encoding: x86, arm)."""
     return (3 << 30) | (size << 16) | (ord(type_char) << 8) | nr
 
 
-_PPS_FETCH = _iowr("p", 0xA4, ctypes.sizeof(_PPSFData))
+# <linux/pps.h>: #define PPS_FETCH _IOWR('p', 0xa4, struct pps_fdata *)
+# The size field is the size of the *pointer*, not of struct pps_fdata.
+_PPS_FETCH = _iowr("p", 0xA4, ctypes.sizeof(ctypes.c_void_p))
 
 
 # u-blox 8 dynamic platform models
@@ -372,7 +381,7 @@ class DeviceConfig(Vertical):
             fdata = _PPSFData()
             fdata.timeout.sec = timeout_sec
             fdata.timeout.nsec = 0
-            fdata.timeout.flags = 0x01  # PPS_CAPTUREASSERT
+            fdata.timeout.flags = 0  # not _PPS_TIME_INVALID: honour the timeout
             fcntl.ioctl(fd, _PPS_FETCH, fdata)
             info = fdata.info
             return (info.assert_tu.sec, info.assert_tu.nsec, info.assert_sequence)
@@ -405,21 +414,15 @@ class DeviceConfig(Vertical):
             return
 
         gps_time_str = self._data.time
+        gps_epoch = parse_gps_time(gps_time_str)
+        if gps_epoch is None:
+            self._append_output(f"Error: cannot parse GPS time {gps_time_str!r}")
+            return
         last_seen = self._data.last_seen
         self._append_output(f"PPS sync: waiting for pulse on {pps_dev}...")
 
         def run():
             try:
-                from datetime import datetime, timezone
-
-                # Parse GPS time
-                ts = gps_time_str.replace("T", " ").replace("Z", "")
-                if "." in ts:
-                    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S.%f")
-                else:
-                    dt = datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
-                dt = dt.replace(tzinfo=timezone.utc)
-                gps_epoch = dt.timestamp()
 
                 # Estimate current GPS time to predict which second the pulse marks
                 elapsed = time.time() - last_seen  # true elapsed (system clock based)
@@ -483,8 +486,8 @@ class DeviceConfig(Vertical):
                         f"System clock adjusted by {offset_ms:+.3f} ms (PPS-disciplined)",
                     )
                 else:
+                    busctl_err = result.stderr.strip()
                     # Fallback: compute absolute time and use sudo -n date
-                    abs_usec = target_sec * 1_000_000
                     abs_dt = datetime.fromtimestamp(target_sec, tz=timezone.utc)
                     utc_str = abs_dt.strftime("%Y-%m-%d %H:%M:%S")
                     result = subprocess.run(
@@ -499,8 +502,9 @@ class DeviceConfig(Vertical):
                     else:
                         self.app.call_from_thread(
                             self._append_output,
-                            f"Error: busctl: {result.stderr.strip()}\n"
-                            f"  Could not apply PPS offset",
+                            f"Error: could not apply PPS offset\n"
+                            f"  busctl: {busctl_err}\n"
+                            f"  sudo: {result.stderr.strip()}",
                         )
             except Exception as e:
                 self.app.call_from_thread(self._append_output, f"PPS sync error: {e}")

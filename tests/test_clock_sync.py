@@ -57,7 +57,7 @@ def _install(monkeypatch, **results):
 
 def test_dbus_success_path(monkeypatch, now):
     fake = _install(monkeypatch)
-    msg = set_clock_from_gps(GPS_TIME, last_seen=GPS_EPOCH)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
 
     assert fake.programs() == ["timedatectl set-ntp", "busctl"]
     assert fake.calls[0] == ["timedatectl", "set-ntp", "false"]
@@ -85,7 +85,7 @@ def test_no_last_seen_means_zero_age(monkeypatch, now):
 def test_fix_age_compensation_large(monkeypatch, now):
     now["now"] = GPS_EPOCH + 3.0
     fake = _install(monkeypatch)
-    msg = set_clock_from_gps(GPS_TIME, last_seen=GPS_EPOCH + 0.75)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH + 0.75)
     # age = 3.0 - 0.75 = 2.25 s
     assert int(fake.calls[1][7]) == int((GPS_EPOCH + 2.25) * 1_000_000)
     assert "12:00:02.500000" in msg
@@ -108,7 +108,7 @@ def test_invalid_time_raises(monkeypatch, now):
 
 def test_timedatectl_fallback(monkeypatch, now):
     fake = _install(monkeypatch, busctl=(1, "", "Access denied"))
-    msg = set_clock_from_gps(GPS_TIME, last_seen=GPS_EPOCH)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
     assert fake.programs() == ["timedatectl set-ntp", "busctl", "timedatectl set-time"]
     local = datetime.fromtimestamp(GPS_EPOCH + 0.5, tz=timezone.utc).astimezone()
     formatted = local.strftime("%Y-%m-%d %H:%M:%S")
@@ -123,7 +123,7 @@ def test_sudo_fallback(monkeypatch, now):
         timedatectl_set_time=(1, "", "Failed to set time"),
         sudo=(0, "Sat Mar 14 12:00:00 UTC 2026\n", ""),
     )
-    msg = set_clock_from_gps(GPS_TIME, last_seen=GPS_EPOCH)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
     assert fake.programs() == ["timedatectl set-ntp", "busctl", "timedatectl set-time", "sudo"]
     assert fake.calls[3] == ["sudo", "-n", "date", "-u", "-s", "2026-03-14 12:00:00.750000"]
     assert msg == "System clock set to: Sat Mar 14 12:00:00 UTC 2026"
@@ -137,24 +137,28 @@ def test_total_failure_message(monkeypatch, now):
         timedatectl_set_time=(1, "", "timedatectl-err"),
         sudo=(1, "", "sudo-err"),
     )
-    msg = set_clock_from_gps(GPS_TIME, last_seen=GPS_EPOCH)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
     assert msg.startswith("Error: could not set time.")
     assert "set-ntp false" in msg
     assert "alice ALL=(ALL) NOPASSWD: /usr/bin/date" in msg
-    # Characterization: the stderr shown is from the *last* command (sudo)
-    assert "sudo-err" in msg
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="New finding N5 (not in plan): failure message labels sudo's stderr as 'busctl'",
-)
-def test_total_failure_reports_busctl_stderr(monkeypatch, now):
+def test_total_failure_reports_each_methods_stderr(monkeypatch, now):
+    """N5: each fallback's own stderr is shown under its own label."""
     _install(
         monkeypatch,
         busctl=(1, "", "busctl-err"),
         timedatectl_set_time=(1, "", "timedatectl-err"),
         sudo=(1, "", "sudo-err"),
     )
-    msg = set_clock_from_gps(GPS_TIME, last_seen=GPS_EPOCH)
+    msg = set_clock_from_gps(GPS_TIME, fix_received=GPS_EPOCH)
     assert "busctl: busctl-err" in msg
+    assert "timedatectl: timedatectl-err" in msg
+    assert "sudo: sudo-err" in msg
+
+
+def test_nanosecond_gps_time(monkeypatch, now):
+    """F11: gpsd may send 9 fractional digits, which strptime's %f rejects."""
+    fake = _install(monkeypatch)
+    set_clock_from_gps("2026-03-14T12:00:00.250000000Z")
+    assert int(fake.calls[1][7]) == int(GPS_EPOCH * 1_000_000)

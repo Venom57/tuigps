@@ -62,23 +62,25 @@ def test_iowr_encoding():
 
 
 def test_pps_struct_layout():
+    """Matches struct pps_ktime / pps_kinfo / pps_fdata in <linux/pps.h> (64-bit)."""
     assert ctypes.sizeof(dc._PPSKTime) == 16
+    assert [(n, getattr(dc._PPSKTime, n).offset) for n, _ in dc._PPSKTime._fields_] == [
+        ("sec", 0), ("nsec", 8), ("flags", 12),
+    ]
     assert ctypes.sizeof(dc._PPSKInfo) == 48
+    assert [(n, getattr(dc._PPSKInfo, n).offset) for n, _ in dc._PPSKInfo._fields_] == [
+        ("assert_sequence", 0), ("clear_sequence", 4), ("assert_tu", 8),
+        ("clear_tu", 24), ("current_mode", 40),
+    ]
     assert ctypes.sizeof(_PPSFData) == 64
+    assert (_PPSFData.info.offset, _PPSFData.timeout.offset) == (0, 48)
 
 
-def test_pps_fetch_current_value():
-    """Characterization: current code encodes sizeof(struct pps_fdata)."""
-    assert dc._PPS_FETCH == _iowr("p", 0xA4, ctypes.sizeof(_PPSFData))
-
-
-@pytest.mark.xfail(
-    strict=True,
-    reason="New finding N2 (not in plan): linux/pps.h defines PPS_FETCH as "
-    "_IOWR('p', 0xa4, struct pps_fdata *) i.e. pointer size, so the ioctl number is wrong",
-)
 def test_pps_fetch_matches_kernel_header():
+    """N2: PPS_FETCH is _IOWR('p', 0xa4, struct pps_fdata *), i.e. pointer size."""
     assert dc._PPS_FETCH == _iowr("p", 0xA4, ctypes.sizeof(ctypes.c_void_p))
+    if ctypes.sizeof(ctypes.c_void_p) == 8:
+        assert dc._PPS_FETCH == 0xC00870A4
 
 
 def test_find_pps_device(monkeypatch):
@@ -142,12 +144,8 @@ def test_wait_for_pps_open_error(monkeypatch):
     assert fake_os.closed == []
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="New finding N3 (not in plan): timeout.flags=0x01 is PPS_TIME_INVALID, which makes "
-    "the kernel ignore the timeout and block forever when no pulse arrives",
-)
 def test_wait_for_pps_timeout_is_honoured(monkeypatch):
+    """N3: PPS_TIME_INVALID in timeout.flags would make the kernel wait forever."""
     seen = {}
 
     def fake_ioctl(fd, req, fdata):
