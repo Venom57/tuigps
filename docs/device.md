@@ -1,73 +1,115 @@
-# Device Configuration
+# Device
 
-The Device tab provides u-blox 8 receiver configuration via ubxtool.
+The Device tab (`4`) configures u-blox 8 receivers through gpsd's `ubxtool`
+and sets the system clock from GPS.
 
-![Device Configuration](screenshots/device.png)
+![Device configuration](screenshots/device.png)
 
-## Controls
+*Screenshot from an earlier version. The tab now also has a **Serial
+Speed** row (under Power Mode), and, further down the scrollable controls,
+the Save/Cold Boot/Read row, the clock row with **Re-enable NTP** and the
+NTP state, and the raw ubxtool command input.*
 
-### Platform Model
-Sets the receiver's dynamic platform model, which optimizes the navigation engine for the expected use case:
+## How commands run
 
-| Model | Use Case |
-|-------|----------|
-| Portable | General purpose (default) |
-| Stationary | Fixed position (timing, base station) |
-| Pedestrian | Walking speed |
-| Automotive | Car/vehicle |
-| Sea | Marine |
-| Airborne <1g/2g/4g | Aviation with varying dynamics |
+- Receiver commands run `ubxtool -P 18 …` (protocol version 18, u-blox 8)
+  in a background thread with a 10-second timeout. The UI stays responsive.
+  Each command is echoed as `$ ubxtool …` in the output log at the bottom,
+  followed by ubxtool's output (or `(no output)`, or an error such as
+  `ubxtool not found (install gpsd-clients)` or `command timed out`).
+- `ubxtool` and `gpsctl` come from **gpsd-clients**. They run on this
+  machine and talk to the **local** gpsd (127.0.0.1:2947), even when tuigps
+  is connected to a remote gpsd.
+- A **Set** button with nothing selected does nothing and says "Select a
+  value first".
 
-### Nav Rate
-Sets the navigation solution update rate. Higher rates increase CPU and power usage:
-- 1 Hz (default), 2 Hz, 5 Hz, 10 Hz
+## Receiver settings
 
-### Power Mode
-Configures the receiver's power management:
-- **Full Power** — Maximum performance, highest power consumption
-- **Balanced** — Reduced power with minimal performance impact
-- **Interval** — Periodic tracking
-- **Aggressive 1Hz/2Hz** — Aggressive power saving with fixed update rate
+| Control | Command | Notes |
+|---------|---------|-------|
+| Platform Model + Set | `-p MODEL,n` | Portable, Stationary, Pedestrian, Automotive, Sea, Airborne <1g/<2g/<4g |
+| Nav Rate + Set | `-p CFG-RATE,ms` | 1, 2, 5 or 10 Hz. Higher rates need a faster serial speed. |
+| Power Mode + Set | `-p PMS,n` | Full Power, Balanced, Interval, Aggressive 1 Hz/2 Hz |
+| Serial Speed + Set | `-S speed`, then `gpsctl -s speed DEVICE` | Asks for confirmation (see below) |
+| Serial Speed: Read | `-p CFG-PRT` | Shows the port configuration |
+| PPS Frequency / Duration + Apply PPS | `-c 06,31,…` (UBX-CFG-TP5) | 1 Hz–10 kHz, pulse 10 µs–100 ms (default 1 Hz, 100 ms) |
+| Disable PPS | CFG-TP5 with the output off | Asks for confirmation |
+| Read PPS | `-p CFG-TP5` | |
+| Constellations: GPS … QZSS | `-e GNSS` / `-d GNSS` | Toggle buttons, see below |
+| Read GNSS | `-p CFG-GNSS` | The receiver's actual constellation setup |
+| Save Config | `-p SAVE` | Asks for confirmation |
+| Cold Boot | `-p COLDBOOT` | Asks for confirmation |
+| Read Nav | `-p CFG-NAV5` | |
+| Read Rate | `-p CFG-RATE` | |
+| ubxtool cmd + Run | `ubxtool -P 18 <your arguments>` | For example `-p MON-VER`. Arguments are split shell-style, so quotes work; unbalanced quotes are reported, not run. |
 
-### Serial Speed
-Sets the receiver's serial port baud rate. Common values are 9600 (default for most u-blox receivers), 38400, 115200, and 460800. Changing the baud rate:
-1. Sends `ubxtool -S SPEED` to configure the receiver
-2. Runs `gpsctl -s SPEED` to update gpsd
+**Constellation buttons** show what tuigps last *sent*. A button turns green
+after `-e` and back to grey after `-d`. They all start grey, because tuigps
+does not read the receiver's state back. Use **Read GNSS** to see what the
+receiver actually tracks. Hiding a constellation from the *display* instead
+is done in Settings (`s`).
 
-**Note:** Use "Save Config" after changing the baud rate to persist across power cycles. Higher baud rates reduce serial latency and are required for high nav rates (5-10 Hz).
+**Serial speed.** tuigps first tells the receiver to switch speed
+(`ubxtool -S`), then tells gpsd to follow (`gpsctl -s SPEED DEVICE`, using the
+device path gpsd reported). Each step's output and any failure is shown. If
+only one side switches, gpsd loses contact with the receiver. Recover by
+power-cycling the receiver or with `gpsctl -s <old speed>`. Use **Save
+Config** to keep the new speed across power cycles.
 
-### PPS Configuration
-Configures the Pulse Per Second timing output:
+## Confirmations
 
-- **PPS Frequency** — Output pulse rate (1 Hz to 10 kHz)
-- **PPS Duration** — Pulse width (10 us to 100 ms)
-- **Apply PPS** — Sends a UBX-CFG-TP5 message with the selected frequency and duration
-- **Disable PPS** — Turns off the timepulse output
-- **Read PPS** — Reads current CFG-TP5 configuration from the receiver
+These actions open a confirmation dialog that says what will happen:
 
-### Constellations
-Toggle buttons to enable/disable GNSS constellations on the receiver. Green indicates enabled. Available constellations: GPS, GLONASS, GALILEO, BEIDOU, SBAS, QZSS.
+- Cold Boot, Save Config, Disable PPS, changing the serial speed
+- Arm Clock Sync (when arming; disarming needs no confirmation)
+- Set Clock (now) and Set Clock (PPS)
 
-### System Clock
+**Cancel** has the focus, so Enter alone never confirms. Escape cancels too.
+Tab to the action button and press Enter (or click it) to go ahead. For the
+clock actions, the checks run *before* the dialog: if there is no GPS time,
+no PPS device, or the time cannot be parsed, the problem is reported at once
+and no dialog opens.
 
-- **Arm Clock Sync** — Arms a clock sync that fires on the very next gpsd message for minimum latency. Click again to disarm.
-- **Set Clock (now)** — Sets the system clock from the latest GPS time, compensating for fix age. Uses D-Bus timedated (no sudo required on most desktop systems), with timedatectl and sudo -n fallbacks.
-- **Set Clock (PPS)** — PPS-disciplined clock sync for sub-millisecond accuracy. Blocks on the kernel PPS ioctl (`PPS_FETCH`) to capture the exact timestamp of the next PPS pulse edge, computes the offset between the kernel timestamp and the GPS second the pulse marks, then applies a relative adjustment via D-Bus SetTime. Requires a `/dev/pps*` device (e.g., `pps_gpio` or `pps_ldisc` kernel module).
-- **Re-enable NTP** — Setting the clock turns systemd NTP sync off (`timedatectl set-ntp false`), or it would undo the change. This button turns it back on (`timedatectl set-ntp true`). The label next to it shows the current NTP state (`timedatectl show -p NTP`).
+## System clock
 
-Arming and both Set Clock buttons ask for confirmation first, and say that NTP will be disabled.
+Setting the clock always turns systemd's NTP sync off first
+(`timedatectl set-ntp false`), because NTP would otherwise undo the change.
 
-### Utility Buttons
-- **Save Config** — Save current configuration to receiver flash (persists across power cycles)
-- **Cold Boot** — Force a cold start (clears ephemeris, almanac, and position)
-- **Read Nav** — Read current CFG-NAV5 navigation configuration
-- **Read Rate** — Read current CFG-RATE update rate configuration
-- **Read GNSS** — Read current CFG-GNSS constellation configuration
+- **Arm Clock Sync**: the clock is set from the *next* new fix that carries
+  a GPS time, directly on the gpsd reader thread, for minimum latency. The
+  button shows `ARMED (click to cancel)` until then. Click it again to
+  disarm.
+- **Set Clock (now)**: sets the clock from the latest fix, adding the fix's
+  age (time since that TPV report was received).
+- **Set Clock (PPS)**: waits for the next PPS pulse on the kernel PPS device
+  and steps the clock by the offset between the kernel timestamp of the
+  pulse and the GPS second it marks. This gives sub-millisecond accuracy.
+  It needs a readable `/dev/pps*` device and a low-latency fix; see
+  [PPS clock sync requirements](timing.md#pps-clock-sync-requirements).
+- **Re-enable NTP**: runs `timedatectl set-ntp true`. No confirmation is
+  needed.
+- **NTP: on / off / ?**: the current state from
+  `timedatectl show -p NTP`. It is updated at startup, after each clock
+  action and after Re-enable NTP. `?` means it could not be
+  determined (for example, there is no systemd).
 
-Cold Boot, Save Config, Disable PPS and changing the serial speed also ask for confirmation (Cancel has the focus; Escape cancels). A serial speed change can lose contact with the receiver if the receiver and gpsd do not both switch.
+How the clock is set, in order of preference:
 
-### Raw Command Input
-Enter any ubxtool command arguments directly (e.g., `-p MON-VER` to read firmware version). Output appears in the log area below.
+1. systemd-timedated over D-Bus (`busctl call … SetTime`). Polkit allows
+   this without sudo for the active local user on most desktops.
+2. `timedatectl set-time` (Set Clock now / armed only).
+3. `sudo -n date` (passwordless sudo only). For PPS sync this fallback is
+   accurate to about a second.
 
-## Command Output
-The bottom panel displays the output from all ubxtool commands, including responses from the receiver and any error messages.
+A missing program or a timed-out command counts as a failed method, and the
+next one is tried. The result is written to the output log. An armed sync
+also shows it as a notification, since it fires while you may be on another
+tab.
+
+- **Success**: "System clock set to …", followed by a reminder that NTP is
+  now disabled and **Re-enable NTP** turns it back on.
+- **Failure**: an error listing each method's own error message. Set Clock
+  (now) and the armed sync also suggest a sudoers rule. If NTP was on before
+  the attempt, it is turned back on automatically. The message ends with
+  "NTP was re-enabled", or says why that failed. A failed attempt therefore
+  never leaves the machine without time sync.

@@ -1,39 +1,119 @@
 # Dashboard
 
-The Dashboard is the main view of tuigps, providing a comprehensive overview of GPS status in a single screen.
+The Dashboard (`1`) is the main view: everything important about the fix on
+one screen.
 
 ![Dashboard](screenshots/dashboard.png)
 
+*Screenshot from a real receiver. The status bar's key hints have changed
+since it was taken: they now include Log, Hold and `?` Help, as space
+allows.*
+
+## Layout
+
+The panel grid adapts to the terminal width:
+
+| Width | Layout |
+|-------|--------|
+| ≥ 120 columns | 3 columns: Position, Fix, Velocity / Sky plot (2 wide), Signal / Errors, Device, Time |
+| 80–119 columns | 2 columns: Position, Fix / Velocity, Errors / Sky plot, Signal / Device, Time |
+| < 80 columns | 1 column, all panels stacked |
+
+Text panels are as tall as their content. The sky plot takes the remaining
+height, down to a minimum. If the terminal is too short, the dashboard
+scrolls instead of cutting panels off.
+
 ## Panels
 
+All distances, altitudes, speeds and error estimates follow the unit system
+(`u` or Settings): metric, imperial or nautical. Coordinates follow the
+coordinate format (DD, DMS or DDM). Values the receiver did not report are
+shown as `---`.
+
 ### Position
-Displays current latitude, longitude, altitude (HAE and MSL), geoid separation, and a clickable Google Maps link when a fix is available. When position hold is active, shows averaged position, standard deviation (N/S, E/W, altitude), and CEP50/CEP95 statistics.
+Latitude and longitude, altitude above the ellipsoid (HAE) and above mean
+sea level (MSL), and the geoid separation. With a fix, there is also a
+clickable **Open in Google Maps** link (`m` does the same).
+
+While position hold is running (`h`), a **Hold** section shows the fix count
+and elapsed time, the mean latitude, longitude and altitude, and the
+standard deviation N/S, E/W and in altitude. It also shows CEP50 and CEP95,
+colored green/yellow/red by size. Standard deviations and CEP need at least
+two fixes. Altitude statistics need fixes that report an altitude.
 
 ### Fix Quality
-Shows fix mode (No Fix / 2D / 3D), fix status (GPS, DGPS, RTK, PPS, etc.), satellites used vs visible, and DOP values (HDOP, VDOP, PDOP).
+Fix mode (No Fix, 2D Fix, 3D Fix) and status (GPS, DGPS, RTK Fix/Float, DR,
+Time Only, PPS Fix and so on), satellites used and visible, and HDOP, VDOP,
+PDOP, GDOP and TDOP, each rated: Ideal < 1, Excellent < 2, Good < 5,
+Moderate < 10, Fair < 20, Poor otherwise.
 
 ### Velocity
-Shows speed (in the selected unit system), track/heading, climb rate, and magnetic variation when available.
+Speed, track (true heading, with a compass point such as `NE`), magnetic
+track, climb rate (m/s, or ft/min in imperial and nautical) and magnetic
+variation.
 
-### Sky Plot
-ASCII polar plot showing satellite positions by elevation and azimuth. Satellites in use are highlighted. Each satellite is labeled by SVN number and color-coded by constellation.
+### Sky plot
+An ASCII polar plot. The center `+` is the zenith, and dotted rings mark the
+horizon and 30° and 60° elevation, with N/S/E/W labels. A
+satellite is drawn as `#` when used in the fix and `o` otherwise, followed
+by its satellite number and colored by constellation. Satellites below the
+horizon or without a position are not drawn. Constellations hidden by the
+display filter (Settings) are not drawn either.
 
 ### Signal Strength
-Bar chart of satellite signal-to-noise ratios (SNR in dBHz), color-coded by constellation (GPS, GLONASS, Galileo, BeiDou, etc.).
+One bar per satellite with a signal (SNR in dBHz, scaled to 55). Satellites
+used in the fix come first, marked `•` and drawn in their constellation's
+color. Unused satellites have grey bars. When the panel is full, a
+`... +N more` line counts the rest. The legend lists the colors of the
+constellations that are shown, and a line counts the satellites hidden by
+the display filter.
 
 ### Error Estimates
-Displays estimated position errors: horizontal (eph), vertical (epv), speed (eps), track (epd), climb (epc), and spherical (sep).
+gpsd's error estimates, shown as ±values: EPH (horizontal), EPV (vertical),
+EPT (time), EPS (speed), EPD (track, degrees) and EPC (climb). EPX, EPY
+(longitude/latitude) and SEP (spherical) appear only when the receiver
+reports them.
 
 ### Device
-Shows the connected GPS device path, driver, baud rate, and update cycle.
+The receiver's device path, driver, baud rate, update cycle and the gpsd
+version. When gpsd reports no device, it says "No device" and shows the gpsd
+version and protocol, if known.
 
 ### Time & Timing
-Displays current GPS date and time in UTC, time error estimate (ept), and leap seconds.
+GPS date and time (UTC), the time error estimate (ept, in µs, ms or s) and
+the leap-second count. The Timing tab has the full timing view.
 
-## Status Bar
+## Stale and disconnected data
 
-The bottom status bar shows key bindings on the left, activity badges in the middle (REC when logging, HOLD when averaging), and GPS status on the right including constellation breakdown (e.g., "4GP+2GA/11sv"), device path, fix mode, and status.
+When the data on screen is not live, every data panel on the Dashboard,
+Satellites and Timing tabs is dimmed and its border is tagged:
 
-## Key Bindings
+| Tag | When |
+|-----|------|
+| `[CONNECTING]` | tuigps is connecting to gpsd |
+| `[DISCONNECTED]` | the connection failed or was lost (tuigps keeps retrying) |
+| `[STALE 12s]` | connected, but no gpsd message for more than 10 seconds (the count goes up) |
 
-All key bindings are shown in the status bar at the bottom of the screen. See the main [README](../README.md) for the full list.
+The last known values stay visible but dimmed, so they can't be mistaken for
+live data. The tag clears as soon as fresh data arrives.
+
+## Status bar
+
+The bottom bar has key hints on the left. In the middle are activity badges:
+`REC n` while logging, `HOLD n` while averaging. The GPS status is on the
+right.
+
+- **Connected, live:** satellites used per constellation and the number
+  visible (for example `4GP+2GA/11sv`; `0/11sv` while none are used), the
+  device path, then the fix mode and status (for example `3D Fix  DGPS`).
+- **Problems:** `CONNECTING…`, `DISCONNECTED — retry in 8s`, `WAITING`
+  (connected, no report yet) or `STALE (12s)`.
+
+The status always fits. When the terminal is narrow, the bar drops, in
+order: the device path, the satellite counts, the badge counts and the key
+hints that don't fit. Dropped hints are replaced by `? Help`.
+
+Connection problems are also announced once per outage with a notification,
+and a reconnect is announced with "Connected to gpsd host:port". While gpsd
+is down, tuigps retries with backoff from 2 s up to 30 s. `r` reconnects
+immediately.
