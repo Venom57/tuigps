@@ -293,6 +293,23 @@ async def test_connection_status_connected_never_seen():
         assert "STALE" not in plain
 
 
+async def test_connection_status_connecting_and_retry_countdown():
+    bar = ConnectionStatus()
+    app = Harness(bar)
+    async with app.run_test(size=(200, 10)):
+        bar.update_gps_data(GPSData(connection_state="connecting"))
+        assert "CONNECTING\u2026" in bar.render().plain
+        bar.update_gps_data(GPSData(connection_state="disconnected",
+                                    next_retry_at=time.time() + 7.5, retry_delay=8.0))
+        assert "DISCONNECTED \u2014 retry in 8s" in bar.render().plain
+        bar.update_gps_data(GPSData(connection_state="disconnected",
+                                    next_retry_at=time.time() - 1))
+        assert "retry in 0s" in bar.render().plain
+        bar.update_gps_data(GPSData(connection_state="disconnected"))
+        plain = bar.render().plain
+        assert "DISCONNECTED" in plain and "retry" not in plain
+
+
 async def test_sky_plot_skips_below_horizon_and_nan():
     sky = SkyPlot()
     app = Harness(sky, height=20)

@@ -23,11 +23,12 @@ def jline(obj: dict) -> bytes:
 
 
 class FakeGpsd:
-    def __init__(self, host: str = "127.0.0.1", banner: dict | None = VERSION_BANNER) -> None:
+    def __init__(self, host: str = "127.0.0.1", banner: dict | None = VERSION_BANNER,
+                 port: int = 0) -> None:
         family = socket.AF_INET6 if ":" in host else socket.AF_INET
         self._server = socket.socket(family, socket.SOCK_STREAM)
         self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind((host, 0))
+        self._server.bind((host, port))
         self._server.listen(8)
         self._server.settimeout(0.1)
         self.host = host

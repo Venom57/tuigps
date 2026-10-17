@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 
 from rich.style import Style
@@ -84,11 +85,18 @@ class ConnectionStatus(Static):
     def _render_status(self) -> Text:
         txt = Text()
 
-        if not self._data or not self._data.connected:
-            txt.append(" DISCONNECTED ", style=Style(color="white", bgcolor="red", bold=True))
+        d = self._data
+        if d is not None and d.connection_state == "connecting":
+            txt.append(" CONNECTING\u2026 ", style=Style(color="black", bgcolor="yellow", bold=True))
+            return txt
+        if d is None or not d.connected:
+            label = " DISCONNECTED "
+            if d is not None and d.next_retry_at > 0:
+                retry_in = max(0, math.ceil(d.next_retry_at - time.time()))
+                label = f" DISCONNECTED \u2014 retry in {retry_in}s "
+            txt.append(label, style=Style(color="white", bgcolor="red", bold=True))
             return txt
 
-        d = self._data
         if d.last_seen <= 0:
             # Connected, but no report received yet
             txt.append(" WAITING ", style=Style(color="black", bgcolor="yellow", bold=True))

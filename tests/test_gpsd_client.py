@@ -186,7 +186,7 @@ def test_unknown_class_marks_seen(client):
     client._data.error_message = "stale error"
     feed(client, WATCH_325, '{"class":"GST","rms":1.0}', '{"class":"ATT"}', received=7.0)
     d = client.data
-    assert d.connected and d.last_seen == 7.0 and d.error_message == ""
+    assert d.last_seen == 7.0 and d.error_message == "stale error"
     assert d.tpv_seq == 0
 
 
@@ -218,7 +218,7 @@ def test_error_report_surfaces_without_disconnect(client):
     client._on_error = errors.append
     feed(client, '{"class":"ERROR","message":"Unrecognized request \'FOO\'"}')
     assert errors == ["gpsd error: Unrecognized request 'FOO'"]
-    assert client.data.connected and client.data.error_message == ""
+    assert client.data.error_message == ""
 
 
 # ─── TPV ────────────────────────────────────────────────────────────────
@@ -820,3 +820,96 @@ def test_stopped_run_errors_are_not_reported(running):
     c._running = True
     c._run()
     assert errors == []
+
+
+# ─── Connection state and reconnect backoff (U2) ───────────────────────
+
+
+def test_states_and_backoff_while_gpsd_is_down(running, refused_port, monkeypatch):
+    monkeypatch.setattr(GPSDClient, "RECONNECT_DELAY", 0.01)
+    monkeypatch.setattr(GPSDClient, "RECONNECT_MAX", 0.08)
+    c = running("127.0.0.1", refused_port)
+    rec = Recorder()
+    rec.start(c)
+    down = lambda: [u for u in rec.updates if u.connection_state == "disconnected"]  # noqa: E731
+    assert rec.wait(lambda: len(down()) >= 6)
+    c.stop()
+    delays = [u.retry_delay for u in down()][:6]
+    assert delays == [0.01, 0.02, 0.04, 0.08, 0.08, 0.08]
+    assert [u.reconnect_attempts for u in down()][:6] == [1, 2, 3, 4, 5, 6]
+    first = down()[0]
+    assert not first.connected and "Connection refused" in first.error_message
+    assert first.next_retry_at == pytest.approx(_real_time.time(), abs=1.0)
+    assert rec.updates[0].connection_state == "connecting"
+    # One notification per outage, not one per attempt
+    assert len(rec.errors) == 1
+
+
+def test_default_backoff_constants():
+    assert GPSDClient.RECONNECT_DELAY == 2.0 and GPSDClient.RECONNECT_MAX == 30.0
+
+
+def test_outage_and_recovery(fake_gpsd, running, monkeypatch):
+    """connected -> disconnected (one error) -> retries -> connected again."""
+    from tests.fake_gpsd import FakeGpsd
+
+    monkeypatch.setattr(GPSDClient, "RECONNECT_DELAY", 0.02)
+    monkeypatch.setattr(GPSDClient, "RECONNECT_MAX", 0.05)
+    port = fake_gpsd.port
+    fake_gpsd.add(TPV_325)
+    c = running("127.0.0.1", port)
+    rec = Recorder()
+    rec.start(c)
+    assert rec.wait(lambda: rec.updates and rec.last.has_fix)
+    assert rec.last.connection_state == "connected" and rec.last.connected
+
+    fake_gpsd.close()  # gpsd goes away entirely: further attempts are refused
+    assert rec.wait(lambda: rec.last.reconnect_attempts >= 3)
+    lost = next(u for u in rec.updates if u.connection_state == "disconnected")
+    assert lost.error_message == "gpsd disconnected"
+    assert lost.retry_delay == 0.02  # the connection delivered data: backoff reset
+    assert lost.reconnect_attempts == 0  # losing a connection is not a failed attempt
+    assert lost.has_fix  # last known data is kept while disconnected
+    assert rec.errors == ["gpsd disconnected"]
+
+    server = FakeGpsd(port=port)  # gpsd is back
+    try:
+        server.add(tpv(lat=10.0))
+        assert rec.wait(lambda: rec.last.connected and rec.last.latitude == 10.0)
+        d = rec.last
+        assert d.connection_state == "connected" and d.error_message == ""
+        assert d.reconnect_attempts == 0 and d.next_retry_at == 0.0
+        assert rec.errors == ["gpsd disconnected"]
+    finally:
+        c.stop()
+        server.close()
+
+
+def test_backoff_grows_when_connections_deliver_nothing(running, monkeypatch):
+    """gpsd accepting and closing at once (no data) does not reset the backoff."""
+    from tests.fake_gpsd import FakeGpsd
+
+    monkeypatch.setattr(GPSDClient, "RECONNECT_DELAY", 0.01)
+    monkeypatch.setattr(GPSDClient, "RECONNECT_MAX", 0.04)
+    server = FakeGpsd(banner=None)
+    stop_dropping = threading.Event()
+
+    def dropper():
+        while not stop_dropping.is_set():
+            server.drop_clients()
+            _real_time.sleep(0.002)
+
+    threading.Thread(target=dropper, daemon=True).start()
+    try:
+        c = running("127.0.0.1", server.port)
+        rec = Recorder()
+        rec.start(c)
+        down = lambda: [u for u in rec.updates if u.connection_state == "disconnected"]  # noqa: E731
+        assert rec.wait(lambda: len(down()) >= 4)
+        c.stop()
+        assert [u.retry_delay for u in down()][:4] == [0.01, 0.02, 0.04, 0.04]
+        # connected -> disconnected is reported each time it happens
+        assert all(e == "gpsd disconnected" for e in rec.errors)
+    finally:
+        stop_dropping.set()
+        server.close()

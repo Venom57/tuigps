@@ -22,7 +22,7 @@ Terminal UI GPS monitoring tool using gpsd.
 - All GPS data flows through a single `GPSData` dataclass
 - Widgets implement `update_gps_data(data: GPSData)` and override `render() -> Text`
 - NaN values are used for unavailable data; always check `math.isfinite()` before display
-- The gpsd client runs in a daemon thread with auto-reconnect (2s delay)
+- The gpsd client runs in a daemon thread with auto-reconnect (exponential backoff 2s → 30s); `GPSData.connection_state` is "connecting" | "connected" | "disconnected", and `on_error` fires once per outage
 - The client mutates a private working `GPSData` and publishes shallow-copy snapshots to `on_update`; it always replaces nested objects/lists, never mutates them in place, so snapshots never change after publication
 - Tests never touch a real gpsd: the default port is patched to a refusing port, and `tests/fake_gpsd.py` provides a scriptable fake gpsd TCP server
 

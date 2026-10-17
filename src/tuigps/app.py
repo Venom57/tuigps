@@ -70,6 +70,7 @@ class TuiGPS(App):
         self._hold = PositionHold()
         self._armed_clock_set = False
         self._last_tpv_seq = 0  # GPSData.tpv_seq last fed to hold/logger
+        self._conn_state = ""  # last GPSData.connection_state seen
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -123,6 +124,18 @@ class TuiGPS(App):
         """Called from the gpsd thread — marshal to Textual event loop."""
         self._gps_data = data
 
+        # Announce (re)connection once per transition into "connected"
+        state = data.connection_state
+        if state != self._conn_state:
+            self._conn_state = state
+            if state == "connected":
+                try:
+                    self.call_from_thread(
+                        self.notify, f"Connected to gpsd {self._gpsd.server}", timeout=3
+                    )
+                except RuntimeError:
+                    pass  # app not running (startup/shutdown)
+
         # Every message (SKY, PPS, NMEA...) re-delivers the current fix; only
         # a new TPV epoch is a new fix for clock sync, logging and hold.
         if data.tpv_seq != self._last_tpv_seq:
@@ -156,7 +169,10 @@ class TuiGPS(App):
             self._hold.add_fix(data.latitude, data.longitude, data.alt_msl)
 
     def _on_gpsd_error(self, error: str) -> None:
-        """Called from the gpsd thread on connection errors."""
+        """Called from the gpsd thread when the connection fails or drops.
+
+        The client reports each outage once (not every reconnect attempt).
+        """
         try:
             self.call_from_thread(self.notify, f"gpsd: {error}", severity="error", timeout=5)
         except RuntimeError:

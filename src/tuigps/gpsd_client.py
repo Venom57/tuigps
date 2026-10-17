@@ -130,7 +130,8 @@ class LineBuffer:
 class GPSDClient:
     """Connects to gpsd in a background thread and keeps GPSData updated."""
 
-    RECONNECT_DELAY = 2.0  # seconds between connection attempts
+    RECONNECT_DELAY = 2.0  # first reconnect delay; doubles per failed attempt
+    RECONNECT_MAX = 30.0  # reconnect backoff cap
     CONNECT_TIMEOUT = 5.0  # TCP connect timeout per address
     POLL_TIMEOUT = 0.5  # max wait per recv()/select(); bounds stop() latency
     STOP_TIMEOUT = 1.0  # max time stop() waits for the thread to exit
@@ -154,6 +155,7 @@ class GPSDClient:
         self._toff_buffer: deque[float] = deque(maxlen=20)
         self._gpsd_toff_received: float = 0.0  # receipt time of last gpsd TOFF
         self.toff_armed = False  # armed: fire on next TPV with GPS time
+        self._got_data = False  # current connection has delivered a line
 
     @property
     def server(self) -> str:
@@ -232,45 +234,73 @@ class GPSDClient:
     # ─── Thread main loop ────────────────────────────────────────────
 
     def _run(self, stop: threading.Event | None = None) -> None:
-        """Connect / read / reconnect loop - runs in the background thread."""
+        """Connect / read / reconnect loop - runs in the background thread.
+
+        Reconnects with exponential backoff (RECONNECT_DELAY doubling up to
+        RECONNECT_MAX), reset once a connection has delivered data. on_error
+        fires only on a transition: the first failure of a run, or losing an
+        established connection - not on every failed retry.
+        """
         if stop is None:
             stop = self._stop_event
+        delay = self.RECONNECT_DELAY
+        error_reported = False  # on_error already fired for the current outage
         while not stop.is_set():
             sock = None
+            self._got_data = False
+            was_connected = False
             try:
+                self._set_state("connecting")
                 sock = self._open_socket(stop)
                 self._sock = sock
                 if stop.is_set():
                     break
                 sock.sendall(WATCH_COMMAND.encode("ascii"))
-                self._on_connected()
+                was_connected = True
+                error_reported = False
+                self._set_state("connected")
                 self._read_loop(sock, stop)
             except _Stopped:
                 break
             except Exception as exc:
                 if stop.is_set():
                     break  # errors caused by stop() closing the socket
-                self._on_connection_lost(self._describe_error(exc))
+                if self._got_data:
+                    delay = self.RECONNECT_DELAY  # a working connection resets the backoff
+                message = self._describe_error(exc)
+                log.info("gpsd connection to %s: %s (retry in %.0fs)", self.server, message, delay)
+                self._set_state("disconnected", error=message, retry_delay=delay,
+                                failed_attempt=not was_connected)
+                if was_connected or not error_reported:
+                    error_reported = True
+                    self._call(self._on_error, message)
             finally:
                 if sock is not None and self._sock is sock:
                     self._sock = None
                 self._close_socket(sock)
 
             # Wait before reconnecting (returns at once when stopped)
-            stop.wait(self.RECONNECT_DELAY)
+            if stop.wait(delay):
+                break
+            delay = min(delay * 2, self.RECONNECT_MAX)
 
-    def _on_connected(self) -> None:
+    def _set_state(self, state: str, error: str | None = None, retry_delay: float = 0.0,
+                   failed_attempt: bool = False) -> None:
+        """Record a connection state change and publish it."""
         with self._lock:
-            self._data.connected = True
-            self._data.error_message = ""
+            d = self._data
+            d.connection_state = state
+            d.connected = state == "connected"
+            if state == "connected":
+                d.error_message = ""
+                d.reconnect_attempts = 0
+            if error is not None:
+                d.error_message = error
+            if failed_attempt:
+                d.reconnect_attempts += 1
+            d.retry_delay = retry_delay
+            d.next_retry_at = time.time() + retry_delay if retry_delay > 0 else 0.0
         self._publish()
-
-    def _on_connection_lost(self, message: str) -> None:
-        with self._lock:
-            self._data.connected = False
-            self._data.error_message = message
-        self._publish()
-        self._call(self._on_error, message)
 
     def _describe_error(self, exc: BaseException) -> str:
         if isinstance(exc, ConnectionError) and str(exc) == "gpsd disconnected":
@@ -344,6 +374,7 @@ class GPSDClient:
             for line in buffer.feed(chunk):
                 if stop.is_set():
                     return
+                self._got_data = True
                 self._handle_line(line, received)
 
     # ─── Message processing ──────────────────────────────────────────
@@ -385,9 +416,7 @@ class GPSDClient:
         cls = msg.get("class", "")
         with self._lock:
             d = self._data
-            d.connected = True
             d.last_seen = received
-            d.error_message = ""
             if cls == "TPV":
                 self._apply_tpv(msg, d, received)
             elif cls == "SKY":

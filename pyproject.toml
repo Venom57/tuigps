@@ -33,6 +33,9 @@ include = ["src/tuigps"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+markers = [
+    "live_gpsd: run the real gpsd client thread in app tests",
+]
 
 [tool.coverage.run]
 source = ["tuigps"]

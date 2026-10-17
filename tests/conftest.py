@@ -92,6 +92,7 @@ def make_gps_data():
         now = time.time()
         d = GPSData(
             connected=True,
+            connection_state="connected",
             last_seen=now,
             tpv_seq=1,
             tpv_received=now,

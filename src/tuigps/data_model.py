@@ -105,10 +105,14 @@ class VersionInfo:
 class GPSData:
     """Complete GPS state — single source of truth for all widgets."""
 
-    # Connection state
+    # Connection state. ``connected`` mirrors connection_state == "connected".
     connected: bool = False
+    connection_state: str = "disconnected"  # "connecting" | "connected" | "disconnected"
     last_seen: float = 0.0  # time.time() of the last message of any class
     error_message: str = ""
+    reconnect_attempts: int = 0  # consecutive failed connection attempts
+    retry_delay: float = 0.0  # current reconnect backoff (seconds)
+    next_retry_at: float = 0.0  # time.time() of the next connection attempt (0 = none)
 
     # TPV epoch tracking: tpv_seq increments on every TPV message, so
     # consumers can tell a new fix from a re-delivery of the same one;

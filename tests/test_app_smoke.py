@@ -35,6 +35,18 @@ WIDGET_IDS = [
 
 
 @pytest.fixture(autouse=True)
+def _idle_gpsd_client(request, monkeypatch):
+    """Keep the app's gpsd thread idle so tests can inject data without races.
+
+    The real client publishes connection-state snapshots (which replace the
+    app's data) as soon as it starts; tests marked ``live_gpsd`` run it.
+    """
+    if request.node.get_closest_marker("live_gpsd"):
+        return
+    monkeypatch.setattr(GPSDClient, "_run", lambda self, stop=None: stop.wait())
+
+
+@pytest.fixture(autouse=True)
 def _no_browser(monkeypatch):
     opened: list[str] = []
     monkeypatch.setattr(app_module.webbrowser, "open", lambda url: opened.append(url))
@@ -50,6 +62,7 @@ def render_all(app: TuiGPS) -> dict[str, str]:
     return {wid: app.query_one(f"#{wid}").render().plain for wid in WIDGET_IDS}
 
 
+@pytest.mark.live_gpsd
 async def test_app_mounts_with_failing_gpsd():
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
@@ -70,6 +83,7 @@ async def test_app_mounts_with_failing_gpsd():
     assert app._gpsd._running is False
 
 
+@pytest.mark.live_gpsd
 async def test_app_shows_data_from_fake_gpsd(fake_gpsd):
     """End to end: fake gpsd -> native client -> dashboard widgets."""
     from tests.test_gpsd_client import DEVICES_325, SKY_325, TPV_325
@@ -88,6 +102,49 @@ async def test_app_shows_data_from_fake_gpsd(fake_gpsd):
         status = app.query_one("#w-connection", ConnectionStatus).render().plain
         assert "3D Fix" in status and "DGPS" in status
         assert "/dev/ttyACM0" in status
+
+
+@pytest.mark.live_gpsd
+async def test_outage_notifies_once_and_reconnect_is_announced(fake_gpsd, monkeypatch):
+    """U2: one error notification per outage, and a notice on reconnect."""
+    from tests.fake_gpsd import FakeGpsd
+    from tests.test_gpsd_client import TPV_325
+
+    monkeypatch.setattr(GPSDClient, "RECONNECT_DELAY", 0.02)
+    monkeypatch.setattr(GPSDClient, "RECONNECT_MAX", 0.05)
+    port = fake_gpsd.port
+    fake_gpsd.add(TPV_325)
+    app = TuiGPS()
+    app._gpsd = GPSDClient("127.0.0.1", port)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)
+
+    async def wait_for(predicate):
+        for _ in range(200):
+            if predicate():
+                return True
+            await pilot.pause(0.02)
+        return False
+
+    server = None
+    async with app.run_test(size=SIZE) as pilot:
+        assert await wait_for(lambda: app._gps_data.has_fix)
+        assert await wait_for(lambda: notes)
+        assert notes == [f"Connected to gpsd 127.0.0.1:{port}"]
+        fake_gpsd.close()
+        assert await wait_for(lambda: app._gps_data.reconnect_attempts >= 3)
+        await pilot.pause(0.05)
+        assert notes[1:] == ["gpsd: gpsd disconnected"]  # once, not per attempt
+        app._refresh_ui()
+        status = app.query_one("#w-connection", ConnectionStatus).render().plain
+        assert "DISCONNECTED" in status or "CONNECTING" in status
+        server = FakeGpsd(port=port)
+        try:
+            assert await wait_for(lambda: len(notes) == 3)
+            assert notes[2] == f"Connected to gpsd 127.0.0.1:{port}"
+        finally:
+            app._gpsd.stop()
+            server.close()
 
 
 async def test_every_tab_activates_and_renders(make_gps_data):
@@ -275,6 +332,7 @@ async def test_settings_apply_same_host_keeps_client():
         assert app._gpsd is client
 
 
+@pytest.mark.live_gpsd
 async def test_settings_apply_new_host_reconnects(monkeypatch):
     attempts = []
 
