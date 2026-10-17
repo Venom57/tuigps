@@ -193,8 +193,7 @@ async def test_units_and_coord_format(make_gps_data):
         plain = pos.render().plain
         assert "47°36'22.32\"N" in plain
         assert "164.9 ft" in plain
-        # Characterization of F10: geoid separation is always metric
-        assert "-19.8 m" in plain
+        assert "Geoid:   -64.8 ft" in plain  # F10: geoid separation follows the units
 
 
 async def test_velocity_units(make_gps_data):
@@ -607,3 +606,73 @@ async def test_satellite_table_and_constellation_panel_filter(make_gps_data):
         p = panel.render().plain
         assert "SBAS      0/1  (hidden)" in p
         assert "GPS       2/3" in p and "(hidden)" not in p.split("SBAS")[0]
+
+
+# ─── Unit system in every widget (F10) ──────────────────────────────────
+
+
+def _hold_result():
+    return HoldResult(mean_lat=47.0, mean_lon=-122.0, mean_alt=10.0, std_north=0.5,
+                      std_east=0.7, std_alt=1.2, cep50=0.71, cep95=1.52,
+                      fix_count=12, duration=75.0)
+
+
+UNIT_EXPECTATIONS = {
+    "metric": {
+        "position": ["Alt MSL: 50.2 m", "Geoid:   -19.8 m", "Avg Alt: 10.0 m",
+                     "Std N/S: 0.500 m", "Std Alt: 1.200 m", "CEP50:   0.710 m", "CEP95:   1.520 m"],
+        "velocity": ["5.4 km/h", "Climb:  0.25 m/s"],
+        "errors": ["EPH: ±3.1 m", "EPV: ±4.2 m", "EPS: ±2.16 km/h", "EPC: ±0.80 m/s",
+                   "EPX: ±2.1 m", "EPY: ±2.2 m", "SEP: ±5.3 m", "EPT: ±0.0050 s", "EPD: ±12.0°"],
+    },
+    "imperial": {
+        "position": ["Alt MSL: 164.9 ft", "Geoid:   -64.8 ft", "Avg Alt: 32.8 ft",
+                     "Std N/S: 1.640 ft", "Std Alt: 3.937 ft", "CEP50:   2.329 ft", "CEP95:   4.987 ft"],
+        "velocity": ["3.4 mph", "Climb:  49 ft/min"],
+        "errors": ["EPH: ±10.2 ft", "EPV: ±13.8 ft", "EPS: ±1.34 mph", "EPC: ±157 ft/min",
+                   "EPX: ±6.9 ft", "EPY: ±7.2 ft", "SEP: ±17.4 ft", "EPT: ±0.0050 s"],
+    },
+    "nautical": {
+        "position": ["Alt MSL: 164.9 ft", "Geoid:   -64.8 ft", "CEP50:   2.329 ft"],
+        "velocity": ["2.9 kn", "Climb:  49 ft/min"],
+        "errors": ["EPH: ±10.2 ft", "EPS: ±1.17 kn", "EPC: ±157 ft/min", "SEP: ±17.4 ft"],
+    },
+}
+
+
+@pytest.mark.parametrize("units", list(UNIT_EXPECTATIONS))
+async def test_every_unit_dependent_widget_follows_units(units, make_gps_data):
+    pos, vel, err = PositionPanel(), VelocityPanel(), ErrorPanel()
+
+    class All(App):
+        def compose(self):
+            yield pos
+            yield vel
+            yield err
+
+    async with All().run_test(size=(100, 80)) as pilot:
+        data = make_gps_data()
+        for w in (pos, vel, err):
+            w.update_gps_data(data)
+        pos.set_hold_data(_hold_result())
+        for w in (pos, vel, err):
+            w.units = units  # reactive: repaints without new data
+        await pilot.pause()
+        rendered = {"position": pos.render().plain, "velocity": vel.render().plain,
+                    "errors": err.render().plain}
+        for name, expected in UNIT_EXPECTATIONS[units].items():
+            for text in expected:
+                assert text in rendered[name], f"[{units}/{name}] {text!r} not in {rendered[name]!r}"
+        if units != "metric":
+            for name, plain in rendered.items():
+                assert " m\n" not in plain and "m/s" not in plain, (name, plain)
+
+
+async def test_error_panel_hides_missing_optional_estimates():
+    err = ErrorPanel(units="imperial")
+    app = Harness(err)
+    async with app.run_test():
+        err.update_gps_data(GPSData())
+        plain = err.render().plain
+        assert "EPH: ---" in plain and "EPC: ---" in plain
+        assert "EPX" not in plain and "SEP" not in plain

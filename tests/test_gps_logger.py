@@ -265,3 +265,111 @@ class TestCSV:
         lg.stop()
         assert "</gpx>" not in path.read_text()
         assert len(path.read_text().splitlines()) == 2
+
+
+# ─── Directory, format and lifecycle (U8) ───────────────────────────────
+
+
+def test_start_creates_missing_directory(tmp_path):
+    target = tmp_path / "a" / "b"
+    lg = GPSLogger(directory=target, fmt="csv")
+    path = lg.start()
+    lg.stop()
+    assert path.parent == target and path.suffix == ".csv"
+    assert path.is_absolute()
+
+
+def test_directory_tilde_is_expanded(tmp_path, monkeypatch):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    lg = GPSLogger(directory="~/gpslogs")
+    path = lg.start()
+    lg.stop()
+    assert path.parent == tmp_path / "gpslogs"
+
+
+def test_relative_directory_gives_absolute_path(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    lg = GPSLogger(directory="logs")
+    path = lg.start()
+    lg.stop()
+    assert path == tmp_path / "logs" / path.name
+
+
+def test_unknown_format_rejected(tmp_path):
+    with pytest.raises(ValueError):
+        GPSLogger(directory=tmp_path, fmt="kml")
+    lg = GPSLogger(directory=tmp_path)
+    with pytest.raises(ValueError):
+        lg.configure(fmt="kml")
+    assert lg.format == "gpx"
+
+
+def test_configure_applies_to_next_start(tmp_path, make_gps_data):
+    lg = GPSLogger(directory=tmp_path / "one", fmt="gpx")
+    first = lg.start()
+    lg.configure(directory=tmp_path / "two", fmt="csv")
+    assert (lg.directory, lg.format) == (tmp_path / "two", "csv")
+    lg.log_point(make_gps_data())  # the open file keeps its own format
+    lg.stop()
+    ET.parse(first)  # still a valid GPX file
+    second = lg.start()
+    lg.stop()
+    assert second.parent == tmp_path / "two" and second.suffix == ".csv"
+
+
+def test_start_while_active_finishes_previous_file(tmp_path, make_gps_data):
+    lg = GPSLogger(directory=tmp_path, fmt="gpx")
+    first = lg.start()
+    lg.log_point(make_gps_data())
+    old_file = lg._file
+    second = lg.start()
+    assert second != first and lg.is_active and lg.fix_count == 0
+    assert old_file.closed  # no leaked file handle
+    assert len(_gpx_points(first)) == 1  # finalized, valid GPX
+    lg.stop()
+    assert _gpx_points(second) == []
+
+
+def test_start_failure_leaves_logger_inactive(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    lg = GPSLogger(directory=blocker / "sub")
+    with pytest.raises(OSError):
+        lg.start()
+    assert not lg.is_active and lg._file is None
+
+
+def test_start_failure_after_active_stops_previous(tmp_path, make_gps_data):
+    lg = GPSLogger(directory=tmp_path)
+    first = lg.start()
+    lg.configure(directory=first)  # a file, not a directory
+    with pytest.raises(OSError):
+        lg.start()
+    assert not lg.is_active
+    ET.parse(first)  # the previous log was still finished properly
+
+
+def test_header_write_failure_closes_file(tmp_path, monkeypatch):
+    lg = GPSLogger(directory=tmp_path)
+
+    def boom(self):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(GPSLogger, "_write_header", boom)
+    with pytest.raises(OSError, match="disk full"):
+        lg.start()
+    assert not lg.is_active and lg._file is None
+
+
+@pytest.mark.skipif(__import__("os").geteuid() == 0, reason="root can write anywhere")
+def test_permission_error(tmp_path):
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    ro.chmod(0o500)
+    try:
+        lg = GPSLogger(directory=ro)
+        with pytest.raises(PermissionError):
+            lg.start()
+        assert not lg.is_active
+    finally:
+        ro.chmod(0o700)

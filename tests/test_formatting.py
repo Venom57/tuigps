@@ -4,7 +4,16 @@ from __future__ import annotations
 
 import pytest
 
-from tuigps.formatting import fmt, fmt_altitude, fmt_coord, fmt_speed, fmt_time_iso
+from tuigps.formatting import (
+    distance_unit,
+    fmt,
+    fmt_altitude,
+    fmt_climb,
+    fmt_coord,
+    fmt_distance,
+    fmt_speed,
+    fmt_time_iso,
+)
 
 NAN = float("nan")
 INF = float("inf")
@@ -127,3 +136,51 @@ class TestFmtTimeIso:
 
     def test_without_fraction(self):
         assert fmt_time_iso("2026-03-14T23:59:59Z") == ("2026-03-14", "23:59:59")
+
+
+# ─── Unit conversion (F10) ──────────────────────────────────────────────
+
+
+@pytest.mark.parametrize(
+    "unit, expected",
+    [("metric", "m"), ("imperial", "ft"), ("nautical", "ft"), ("bogus", "m")],
+)
+def test_distance_unit(unit, expected):
+    assert distance_unit(unit) == expected
+
+
+@pytest.mark.parametrize(
+    "meters, unit, spec, expected",
+    [
+        (100.0, "metric", ".1f", "100.0 m"),
+        (100.0, "imperial", ".1f", "328.1 ft"),
+        (100.0, "nautical", ".0f", "328 ft"),
+        (-19.75, "metric", ".1f", "-19.8 m"),
+        (0.71, "imperial", ".3f", "2.329 ft"),
+        (float("nan"), "imperial", ".1f", "---"),
+        (float("inf"), "metric", ".1f", "---"),
+    ],
+)
+def test_fmt_distance(meters, unit, spec, expected):
+    assert fmt_distance(meters, unit, spec) == expected
+
+
+@pytest.mark.parametrize(
+    "mps, unit, expected",
+    [
+        (0.25, "metric", "0.25 m/s"),
+        (-1.0, "metric", "-1.00 m/s"),
+        (0.25, "imperial", "49 ft/min"),
+        (1.0, "nautical", "197 ft/min"),
+        (-0.5, "imperial", "-98 ft/min"),
+        (float("nan"), "imperial", "---"),
+    ],
+)
+def test_fmt_climb(mps, unit, expected):
+    assert fmt_climb(mps, unit) == expected
+
+
+def test_fmt_speed_precision():
+    assert fmt_speed(0.6, "metric", ".2f") == "2.16 km/h"
+    assert fmt_speed(0.6, "nautical", ".2f") == "1.17 kn"
+    assert fmt_speed(1.0, "other", ".2f") == "1.00 m/s"

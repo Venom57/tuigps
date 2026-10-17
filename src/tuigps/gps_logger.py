@@ -14,12 +14,21 @@ from .data_model import GPSData
 GPXTPX_NS = "http://www.garmin.com/xmlschemas/TrackPointExtension/v2"
 
 
-class GPSLogger:
-    """Logs GPS fixes to GPX or CSV files."""
+LOG_FORMATS = ("gpx", "csv")
 
-    def __init__(self, directory: str = ".", fmt: str = "gpx"):
+
+class GPSLogger:
+    """Logs GPS fixes to GPX or CSV files.
+
+    The directory (``~`` expanded, created if missing) and format apply to
+    the next ``start()``; a file being written keeps its own format.
+    """
+
+    def __init__(self, directory: str | Path = ".", fmt: str = "gpx"):
         self._directory = Path(directory)
-        self._format = fmt  # "gpx" or "csv"
+        self._format = fmt  # "gpx" or "csv": for the next start()
+        self._check_format(fmt)
+        self._file_format = fmt  # format of the open file
         self._file = None
         self._active = False
         self._count = 0
@@ -42,40 +51,84 @@ class GPSLogger:
         return self._filepath
 
     @property
+    def directory(self) -> Path:
+        return self._directory
+
+    @property
+    def format(self) -> str:
+        return self._format
+
+    @staticmethod
+    def _check_format(fmt: str) -> None:
+        if fmt not in LOG_FORMATS:
+            raise ValueError(f"unknown log format {fmt!r} (expected gpx or csv)")
+
+    def configure(self, directory: str | Path | None = None, fmt: str | None = None) -> None:
+        """Set the directory and/or format used by the next start()."""
+        if fmt is not None:
+            self._check_format(fmt)
+        with self._lock:
+            if directory is not None:
+                self._directory = Path(directory)
+            if fmt is not None:
+                self._format = fmt
+
+    @property
     def elapsed(self) -> float:
         if not self._active:
             return 0.0
         return time.time() - self._start_time
 
     def _open_new_file(self) -> None:
-        """Create a new log file, never overwriting an existing one."""
+        """Create a new log file, never overwriting an existing one.
+
+        Creates the directory if needed. Raises OSError on failure, leaving
+        the logger inactive.
+        """
+        directory = self._directory.expanduser()
+        directory.mkdir(parents=True, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         ext = self._format
         suffix = 0
         while True:
             name = f"tuigps_{ts}.{ext}" if suffix == 0 else f"tuigps_{ts}_{suffix}.{ext}"
-            path = self._directory / name
+            path = directory / name
             try:
-                self._file = open(path, "x")
+                self._file = open(path, "x", encoding="utf-8")
             except FileExistsError:
                 suffix += 1
                 continue
-            self._filepath = path
+            self._filepath = path.absolute()
+            self._file_format = self._format
             return
 
     def start(self) -> Path:
-        """Start logging. Returns the file path."""
+        """Start logging to a new file and return its absolute path.
+
+        If a log is already active it is finished and closed first, so a
+        second start() rotates to a new file instead of leaking the old one.
+        Raises OSError if the directory or file cannot be created.
+        """
         with self._lock:
+            self._stop()
             return self._start()
 
     def _start(self) -> Path:
         self._open_new_file()
+        try:
+            self._write_header()
+        except OSError:
+            self._file.close()
+            self._file = None
+            raise
         self._active = True
         self._count = 0
         self._start_time = time.time()
         self._last_time = ""
+        return self._filepath
 
-        if self._format == "gpx":
+    def _write_header(self) -> None:
+        if self._file_format == "gpx":
             self._file.write(
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<gpx version="1.1" creator="tuigps"\n'
@@ -85,13 +138,12 @@ class GPSLogger:
                 "    <name>tuigps log</name>\n"
                 "    <trkseg>\n"
             )
-        elif self._format == "csv":
+        elif self._file_format == "csv":
             self._file.write(
                 "timestamp,latitude,longitude,alt_msl,speed,track,"
                 "mode,status,hdop,eph,epv,satellites_used\n"
             )
         self._file.flush()
-        return self._filepath
 
     def stop(self) -> None:
         """Stop logging and close the file."""
@@ -102,7 +154,7 @@ class GPSLogger:
         if not self._active:
             return
         if self._file:
-            if self._format == "gpx":
+            if self._file_format == "gpx":
                 self._file.write(
                     "    </trkseg>\n"
                     "  </trk>\n"
@@ -129,9 +181,9 @@ class GPSLogger:
                 return
             self._last_time = data.time
 
-        if self._format == "gpx":
+        if self._file_format == "gpx":
             self._write_gpx_point(data)
-        elif self._format == "csv":
+        elif self._file_format == "csv":
             self._write_csv_point(data)
         self._count += 1
         self._file.flush()

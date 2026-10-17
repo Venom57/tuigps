@@ -45,26 +45,54 @@ def fmt_coord(value: float, axis: str = "lat", style: str = "dd") -> str:
     return f"{abs_val:.6f}\u00b0 {direction}"
 
 
-def fmt_speed(mps: float, unit: str = "metric") -> str:
+# Unit systems: "metric" (m, km/h, m/s climb), "imperial" (ft, mph,
+# ft/min climb) and "nautical" (ft, knots, ft/min climb).
+M_TO_FT = 3.28084
+MPS_TO_KMH = 3.6
+MPS_TO_MPH = 2.23694
+MPS_TO_KN = 1.94384
+MPS_TO_FPM = M_TO_FT * 60.0
+
+
+def distance_unit(unit: str = "metric") -> str:
+    """The distance/altitude unit label for a unit system ("m" or "ft")."""
+    return "ft" if unit in ("imperial", "nautical") else "m"
+
+
+def fmt_distance(meters: float, unit: str = "metric", spec: str = ".1f") -> str:
+    """Format a distance (or altitude, error estimate) in m or ft."""
+    if not math.isfinite(meters):
+        return "---"
+    if distance_unit(unit) == "ft":
+        return f"{meters * M_TO_FT:{spec}} ft"
+    return f"{meters:{spec}} m"
+
+
+def fmt_speed(mps: float, unit: str = "metric", spec: str = ".1f") -> str:
     """Format speed from m/s to the chosen unit system."""
     if not math.isfinite(mps):
         return "---"
     if unit == "metric":
-        return f"{mps * 3.6:.1f} km/h"
+        return f"{mps * MPS_TO_KMH:{spec}} km/h"
     elif unit == "imperial":
-        return f"{mps * 2.23694:.1f} mph"
+        return f"{mps * MPS_TO_MPH:{spec}} mph"
     elif unit == "nautical":
-        return f"{mps * 1.94384:.1f} kn"
-    return f"{mps:.1f} m/s"
+        return f"{mps * MPS_TO_KN:{spec}} kn"
+    return f"{mps:{spec}} m/s"
+
+
+def fmt_climb(mps: float, unit: str = "metric") -> str:
+    """Format a vertical speed: m/s (metric) or ft/min (imperial, nautical)."""
+    if not math.isfinite(mps):
+        return "---"
+    if distance_unit(unit) == "ft":
+        return f"{mps * MPS_TO_FPM:.0f} ft/min"
+    return f"{mps:.2f} m/s"
 
 
 def fmt_altitude(meters: float, unit: str = "metric") -> str:
     """Format altitude from meters to the chosen unit system."""
-    if not math.isfinite(meters):
-        return "---"
-    if unit in ("imperial", "nautical"):
-        return f"{meters * 3.28084:.1f} ft"
-    return f"{meters:.1f} m"
+    return fmt_distance(meters, unit, ".1f")
 
 
 def fmt_time_iso(iso_str: str) -> tuple[str, str]:

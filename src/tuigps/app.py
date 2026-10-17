@@ -20,6 +20,7 @@ from . import config as config_mod
 from .clock_sync import set_clock_from_gps
 from .config import Config
 from .data_model import GPSData
+from .formatting import fmt_distance
 from .gps_logger import GPSLogger
 from .gpsd_client import GPSDClient
 from .position_hold import PositionHold
@@ -565,18 +566,23 @@ class TuiGPS(App):
             self._gps_logger.stop()
             self.notify(f"Logging stopped: {path} ({self._gps_logger.fix_count} pts)", timeout=4)
         else:
-            path = self._gps_logger.start()
-            self.notify(f"Logging to {path}", timeout=3)
+            cfg = self._config
+            try:
+                self._gps_logger.configure(directory=cfg.log_dir, fmt=cfg.log_format)
+                path = self._gps_logger.start()
+            except (OSError, ValueError) as exc:
+                log.warning("cannot start logging: %s", exc)
+                self.notify(f"Cannot start logging: {exc}", severity="error", timeout=6)
+            else:
+                self.notify(f"Logging ({cfg.log_format.upper()}) to {path}", timeout=5)
         self._refresh_ui()
 
     def action_toggle_hold(self) -> None:
         """Toggle position hold/averaging."""
         if self._hold.is_active:
             result = self._hold.stop()
-            self.notify(
-                f"Hold stopped: {result.fix_count} fixes, CEP50={result.cep50:.2f}m",
-                timeout=4,
-            )
+            cep50 = fmt_distance(result.cep50, self._units, ".2f")
+            self.notify(f"Hold stopped: {result.fix_count} fixes, CEP50={cep50}", timeout=4)
         else:
             self._hold.start()
             self.notify("Position hold started — accumulating fixes", timeout=3)

@@ -9,7 +9,7 @@ from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..data_model import GPSData
-from ..formatting import fmt, fmt_altitude, fmt_coord
+from ..formatting import fmt_altitude, fmt_coord, fmt_distance
 from ..position_hold import HoldResult
 
 
@@ -72,7 +72,7 @@ class PositionPanel(Static):
         txt.append(fmt_altitude(d.alt_msl, self.units) + "\n")
 
         txt.append("  Geoid:   ", style="bright_black")
-        txt.append(fmt(d.geoid_sep, ".1f", " m") + "\n")
+        txt.append(fmt_distance(d.geoid_sep, self.units) + "\n")
 
         if d.has_fix:
             url = f"https://maps.google.com/?q={d.latitude:.6f},{d.longitude:.6f}"
@@ -83,6 +83,7 @@ class PositionPanel(Static):
         # Position hold statistics
         if self._hold and self._hold.fix_count > 0:
             h = self._hold
+            u = self.units
             mins = int(h.duration) // 60
             secs = int(h.duration) % 60
             txt.append(f"─ Hold ({h.fix_count} fixes, {mins}:{secs:02d}) ─\n", style="bold cyan")
@@ -98,21 +99,21 @@ class PositionPanel(Static):
 
             if math.isfinite(h.std_north) and h.fix_count >= 2:
                 txt.append("  Std N/S: ", style="bright_black")
-                txt.append(f"{h.std_north:.3f} m\n")
+                txt.append(fmt_distance(h.std_north, u, ".3f") + "\n")
                 txt.append("  Std E/W: ", style="bright_black")
-                txt.append(f"{h.std_east:.3f} m\n")
+                txt.append(fmt_distance(h.std_east, u, ".3f") + "\n")
 
                 if math.isfinite(h.std_alt):
                     txt.append("  Std Alt: ", style="bright_black")
-                    txt.append(f"{h.std_alt:.3f} m\n")
+                    txt.append(fmt_distance(h.std_alt, u, ".3f") + "\n")
 
-                # CEP with color coding
+                # CEP with color coding (thresholds in meters)
                 txt.append("  CEP50:   ", style="bright_black")
                 cep_color = "green" if h.cep50 < 2 else "yellow" if h.cep50 < 5 else "red"
-                txt.append(f"{h.cep50:.3f} m\n", style=cep_color)
+                txt.append(fmt_distance(h.cep50, u, ".3f") + "\n", style=cep_color)
 
                 txt.append("  CEP95:   ", style="bright_black")
                 cep95_color = "green" if h.cep95 < 5 else "yellow" if h.cep95 < 10 else "red"
-                txt.append(f"{h.cep95:.3f} m\n", style=cep95_color)
+                txt.append(fmt_distance(h.cep95, u, ".3f") + "\n", style=cep95_color)
 
         return txt

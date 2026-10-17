@@ -10,7 +10,7 @@ from textual.widgets import Static
 
 from ..constants import bearing_to_compass
 from ..data_model import GPSData
-from ..formatting import fmt, fmt_speed
+from ..formatting import fmt_climb, fmt_speed
 
 
 class VelocityPanel(Static):
@@ -69,7 +69,7 @@ class VelocityPanel(Static):
 
         # Climb
         txt.append("  Climb:  ", style="bright_black")
-        txt.append(fmt(d.climb, ".2f", " m/s") + "\n")
+        txt.append(fmt_climb(d.climb, self.units) + "\n")
 
         # Magnetic variation
         txt.append("  MagVar: ", style="bright_black")

@@ -1026,3 +1026,58 @@ async def test_filter_from_config_applies_to_every_view(config_file, make_gps_da
         assert "Galileo   1/1  (hidden)" in panel
         assert "3 used / 7 visible" in panel
         assert data.satellites_used == 3  # data itself is untouched
+
+
+# ─── Logging settings (U8) and units everywhere (F10) ─────────────────
+
+
+async def test_log_uses_configured_directory_and_format(tmp_path, config_file, make_gps_data):
+    log_dir = tmp_path / "gps" / "logs"
+    config_mod.save(Config(log_format="csv", log_dir=str(log_dir)))
+    notes = []
+    app = TuiGPS()
+    app.notify = lambda message, **kw: notes.append(message)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("l")
+        assert app._gps_logger.is_active
+        path = app._gps_logger.filepath
+        assert path.parent == log_dir and path.suffix == ".csv"
+        assert notes[-1] == f"Logging (CSV) to {path}"  # the full path
+        await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
+        await settle(pilot, app)
+        await pilot.press("l")
+    assert len(path.read_text().splitlines()) == 2  # header + one fix
+
+
+async def test_log_start_error_is_notified(tmp_path, config_file):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    config_mod.save(Config(log_dir=str(blocker)))
+    notes = []
+    app = TuiGPS()
+    app.notify = lambda message, **kw: notes.append((message, kw.get("severity")))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("l")
+        await pilot.pause()
+        assert app.is_running and not app._gps_logger.is_active
+        assert "REC" not in app.query_one("#w-connection").render().plain
+    assert notes[-1][1] == "error" and notes[-1][0].startswith("Cannot start logging")
+
+
+async def test_units_key_updates_every_panel(make_gps_data):
+    app = TuiGPS()
+    notes = []
+    app.notify = lambda message, **kw: notes.append(message)
+    async with app.run_test(size=SIZE) as pilot:
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        await pilot.press("u")  # imperial
+        q = app.query_one
+        assert "Geoid:   -64.8 ft" in q("#w-position").render().plain
+        assert "49 ft/min" in q("#w-velocity").render().plain
+        assert "EPH: ±10.2 ft" in q("#w-errors").render().plain
+        await pilot.press("h")
+        app._hold.add_fix(47.0, -122.0, 10.0)
+        app._hold.add_fix(47.00001, -122.0, 11.0)
+        await pilot.press("h")
+    assert notes[-1].startswith("Hold stopped: 2 fixes, CEP50=") and notes[-1].endswith(" ft")
