@@ -525,8 +525,8 @@ async def test_failing_widget_update_is_logged_not_fatal(make_gps_data, monkeypa
         app._refresh_ui()
         await pilot.pause()
         assert app.is_running
-        # Widgets after the failing one were still updated
-        assert "/dev/ttyACM0" in app.query_one("#w-device-detail").render().plain
+        # Widgets after the failing one (on the active tab) were still updated
+        assert "/dev/ttyACM0" in app.query_one("#w-device").render().plain
     assert any("#w-fix" in r.getMessage() and r.exc_info for r in caplog.records)
 
 
@@ -650,3 +650,97 @@ async def test_producer_running_across_shutdown_is_safe(make_gps_data):
     thread.join(2)
     assert errors == []
     assert app._tick_handle is None
+
+
+# ─── Active-tab refresh, redundant renders, NMEA batches (P3/P5) ──────
+
+
+async def test_only_the_active_tab_is_refreshed(make_gps_data):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        data = make_gps_data()
+        app._gps_data = data
+        app._refresh_ui()
+        q = app.query_one
+        assert q("#w-position")._data is data and q("#w-skyplot")._data is data
+        assert q("#w-connection")._data is data
+        assert q("#w-device-config")._data is data  # always fed: clock set needs GPS time
+        assert q("#w-sattable")._data is not data  # hidden tabs are not refreshed...
+        assert q("#w-time-detail")._data is not data
+        app.query_one(TabbedContent).active = "tab-satellites"
+        await pilot.pause()
+        # ...until they are shown
+        assert q("#w-sattable")._data is data and q("#w-constellations")._data is data
+        assert "Total:" in q("#w-constellations").render().plain
+        app.query_one(TabbedContent).active = "tab-timing"
+        await pilot.pause()
+        assert q("#w-time-detail")._data is data and q("#w-device-detail")._data is data
+
+
+async def test_identical_snapshot_does_not_repaint(make_gps_data, monkeypatch):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        sky, bar = app.query_one("#w-skyplot"), app.query_one("#w-connection")
+        repaints = {"sky": 0, "bar": 0}
+        monkeypatch.setattr(sky, "refresh", lambda *a, **k: repaints.__setitem__("sky", repaints["sky"] + 1))
+        monkeypatch.setattr(bar, "refresh", lambda *a, **k: repaints.__setitem__("bar", repaints["bar"] + 1))
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        assert repaints == {"sky": 1, "bar": 1}
+        app._refresh_ui()  # same snapshot, same settings: nothing to repaint
+        assert repaints == {"sky": 1, "bar": 1}
+        app._heartbeat()  # the status bar is time-dependent (staleness)
+        assert repaints == {"sky": 1, "bar": 2}
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        assert repaints == {"sky": 2, "bar": 3}
+
+
+async def test_units_change_repaints_without_new_data(make_gps_data, monkeypatch):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        pos = app.query_one("#w-position", PositionPanel)
+        repaints = []
+        monkeypatch.setattr(pos, "refresh", lambda *a, **k: repaints.append(1))
+        app._refresh_ui()
+        assert repaints == []
+        await pilot.press("u")  # same snapshot, new display setting
+        assert repaints
+        assert "ft" in pos.render().plain
+
+
+async def test_nmea_is_delivered_in_batches(monkeypatch):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        viewer = app.query_one(NMEAViewer)
+        batches = []
+        original = viewer.append_nmea_batch
+
+        def record(sentences):
+            batches.append(len(sentences))
+            original(sentences)
+
+        monkeypatch.setattr(viewer, "append_nmea_batch", record)
+        sentences = [f"$GP{t},{i}*00" for i in range(100) for t in ("GGA", "RMC", "GSV")]
+
+        def produce():
+            for s in sentences:
+                app._on_nmea(s)
+
+        await asyncio.to_thread(produce)
+        await settle(pilot, app)
+        assert sum(batches) == 300
+        assert len(batches) <= 4
+        assert viewer._total == 300 and viewer._type_counts["GSV"] == 100
+        assert list(viewer._buffer)[-1] == sentences[-1]
+        app.query_one(TabbedContent).active = "tab-nmea"
+        await pilot.pause()
+        log = viewer.query_one("#nmea-log", RichLog)
+        assert len(log.lines) == 300
+        assert viewer.query_one("#nmea-stats").render().plain.startswith("300 sentences")

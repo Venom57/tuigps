@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 
 from rich.text import Text
+from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..data_model import GPSData
@@ -23,6 +24,10 @@ class PositionPanel(Static):
     }
     """
 
+    # Display settings: changing one repaints the panel
+    coord_format = reactive("dd")
+    units = reactive("metric")
+
     def __init__(self, coord_format: str = "dd", units: str = "metric", **kwargs):
         super().__init__(**kwargs)
         self._data: GPSData | None = None
@@ -31,9 +36,14 @@ class PositionPanel(Static):
         self.units = units
 
     def set_hold_data(self, result: HoldResult | None) -> None:
-        self._hold = result
+        if result is None and self._hold is None:
+            return
+        self._hold = result  # a new result each time (its duration keeps growing)
+        self.refresh()
 
     def update_gps_data(self, data: GPSData) -> None:
+        if data is self._data:
+            return  # same immutable snapshot: nothing new to draw
         self._data = data
         self.refresh()
 

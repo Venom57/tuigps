@@ -119,14 +119,25 @@ class NMEAViewer(Vertical):
 
     def append_nmea(self, sentence: str) -> None:
         """Add an NMEA sentence to the viewer."""
-        self._buffer.append(sentence)
-        self._total += 1
-        self._type_counts[_sentence_type(sentence)] += 1
-        self._arrivals.append(time.monotonic())
+        self.append_nmea_batch((sentence,))
+
+    def append_nmea_batch(self, sentences) -> None:
+        """Add several NMEA sentences at once (one log write and stats update)."""
+        if not sentences:
+            return
+        now = time.monotonic()
+        buffer = self._buffer
+        counts = self._type_counts
+        for sentence in sentences:
+            buffer.append(sentence)
+            counts[_sentence_type(sentence)] += 1
+        n = len(sentences)
+        self._total += n
+        self._arrivals.extend([now] * n)
         if self._paused:
-            self._pending = min(self._pending + 1, len(self._buffer))
+            self._pending = min(self._pending + n, len(buffer))
         else:
-            self._write_sentence(sentence)
+            self._write_sentences(sentences)
         self._update_stats()
 
     def _shown(self) -> list[str]:
@@ -141,27 +152,35 @@ class NMEAViewer(Vertical):
         except NoMatches:
             return
         log.clear()
-        for sentence in self._shown():
-            if self._matches_filter(sentence):
-                log.write(self._colorize(sentence))
+        self._write_sentences(self._shown())
 
     def _flush_pending(self) -> None:
         """Write the sentences received while paused to the log."""
         if self._pending:
             pending = list(self._buffer)[-self._pending:]
             self._pending = 0
-            for sentence in pending:
-                self._write_sentence(sentence)
+            self._write_sentences(pending)
 
-    def _write_sentence(self, sentence: str) -> None:
-        """Write a single sentence to the log if it matches the filter."""
-        if not self._matches_filter(sentence):
+    def _write_sentences(self, sentences) -> None:
+        """Write the sentences that match the filter to the log, in one write."""
+        if self._filter:
+            sentences = [s for s in sentences if self._matches_filter(s)]
+        if not sentences:
             return
         try:
             log = self.query_one("#nmea-log", RichLog)
         except NoMatches:
             return
-        log.write(self._colorize(sentence))
+        if len(sentences) == 1:
+            log.write(self._colorize(sentences[0]))
+            return
+        text = Text()
+        last = len(sentences) - 1
+        for i, sentence in enumerate(sentences):
+            text.append(sentence, style=self._color(sentence))
+            if i < last:
+                text.append("\n")
+        log.write(text)
 
     def _rate(self) -> float:
         """Sentences per second over the last RATE_WINDOW seconds."""
@@ -191,8 +210,10 @@ class NMEAViewer(Vertical):
             return True
         return _sentence_type(sentence) == self._filter
 
+    @staticmethod
+    def _color(sentence: str) -> str:
+        return SENTENCE_COLORS.get(_sentence_type(sentence), "white")
+
     def _colorize(self, sentence: str) -> Text:
         """Apply color based on sentence type."""
-        stype = _sentence_type(sentence)
-        color = SENTENCE_COLORS.get(stype, "white")
-        return Text(sentence, style=color)
+        return Text(sentence, style=self._color(sentence))

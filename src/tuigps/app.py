@@ -45,6 +45,19 @@ UI_REFRESH_HZ = 10.0
 UI_MIN_INTERVAL = 1.0 / UI_REFRESH_HZ
 NMEA_QUEUE_MAX = 5000  # sentences buffered between UI ticks (oldest dropped)
 
+# Widgets refreshed per tab: only the active tab (plus the status bar and the
+# non-rendering DeviceConfig) is updated on each refresh.
+TAB_WIDGETS: dict[str, tuple[str, ...]] = {
+    "tab-dashboard": (
+        "w-position", "w-fix", "w-velocity", "w-skyplot",
+        "w-signal", "w-errors", "w-device", "w-time",
+    ),
+    "tab-satellites": ("w-constellations", "w-sattable"),
+    "tab-timing": ("w-time-detail", "w-device-detail"),
+    "tab-device": (),  # DeviceConfig is always updated (see _refresh_ui)
+    "tab-nmea": (),  # NMEA is delivered in batches (see _drain_nmea)
+}
+
 
 class TuiGPS(App):
     """GPS monitoring terminal application."""
@@ -88,6 +101,13 @@ class TuiGPS(App):
         self._nmea_queue: deque[str] = deque(maxlen=NMEA_QUEUE_MAX)
         self._last_tick = 0.0  # time.monotonic() of the last UI tick
         self._tick_handle = None  # asyncio TimerHandle of a delayed tick
+        # Widget references, cached after mount (see _cache_widgets)
+        self._tab_widgets: dict[str, list] = {}
+        self._tabs: TabbedContent | None = None
+        self._status_bar: ConnectionStatus | None = None
+        self._device_config: DeviceConfig | None = None
+        self._nmea_viewer: NMEAViewer | None = None
+        self._arm_toff_button: Button | None = None
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -120,7 +140,20 @@ class TuiGPS(App):
                 yield NMEAViewer(id="w-nmea")
         yield ConnectionStatus(id="w-connection")
 
+    def _cache_widgets(self) -> None:
+        """Look the refreshed widgets up once, instead of on every refresh."""
+        self._tab_widgets = {
+            tab: [self.query_one(f"#{wid}") for wid in ids] for tab, ids in TAB_WIDGETS.items()
+        }
+        self._tabs = self.query_one(TabbedContent)
+        self._status_bar = self.query_one("#w-connection", ConnectionStatus)
+        self._device_config = self.query_one("#w-device-config", DeviceConfig)
+        self._nmea_viewer = self.query_one("#w-nmea", NMEAViewer)
+        self._arm_toff_button = self.query_one("#btn-arm-toff", Button)
+
     def on_mount(self) -> None:
+        self._cache_widgets()
+
         # Build sorted theme list, default to textual-dark
         self._theme_list = sorted(self.available_themes.keys())
         self.theme = "textual-dark"
@@ -282,7 +315,7 @@ class TuiGPS(App):
     def _deliver_clock_result(self, message: str) -> None:
         """Show clock sync result in Device tab output and as notification."""
         with self._ui_guard("clock result"):
-            config = self.query_one("#w-device-config", DeviceConfig)
+            config = self._device_config or self.query_one("#w-device-config", DeviceConfig)
             config._append_output(message)
             # Reset the arm button
             btn = config.query_one("#btn-arm-clock", Button)
@@ -297,58 +330,74 @@ class TuiGPS(App):
 
     def _deliver_nmea_batch(self, sentences: list[str]) -> None:
         """Deliver queued NMEA sentences to the viewer widget (on Textual thread)."""
+        if self._nmea_viewer is None:
+            return
         with self._ui_guard("#w-nmea"):
-            viewer = self.query_one("#w-nmea", NMEAViewer)
-            for sentence in sentences:
-                viewer.append_nmea(sentence)
+            self._nmea_viewer.append_nmea_batch(sentences)
 
-    def _refresh_ui(self) -> None:
-        """Push current GPS data to all widgets."""
-        # Pass hold data to position panel
-        with self._ui_guard("#w-position"):
-            pos = self.query_one("#w-position", PositionPanel)
-            pos.units = self._units
-            pos.coord_format = self._coord_format
-            pos.set_hold_data(self._hold.result if self._hold.is_active else None)
-            pos.update_gps_data(self._gps_data)
+    def _refresh_ui(self, heartbeat: bool = False) -> None:
+        """Push the current GPS data to the status bar and the active tab.
 
-        # Pass logging/hold state to connection status
+        Widgets skip repainting for a snapshot they already show; ``heartbeat``
+        also repaints the time-dependent status bar (staleness, retry countdown).
+        """
+        if self._tabs is None:
+            return  # not mounted yet
+        data = self._gps_data
+
+        # Logging/hold state and GPS status in the status bar
         with self._ui_guard("#w-connection"):
-            conn = self.query_one("#w-connection", ConnectionStatus)
+            conn = self._status_bar
             conn.logging_active = self._gps_logger.is_active
             conn.log_count = self._gps_logger.fix_count
             conn.hold_active = self._hold.is_active
             conn.hold_count = self._hold.fix_count
-            conn.update_gps_data(self._gps_data)
+            conn.update_gps_data(data)
+            if heartbeat:
+                conn.refresh()
 
         # Check if armed TOFF fired (single-shot)
-        if not self._gpsd.toff_armed and math.isfinite(self._gps_data.toff_armed_offset):
+        if not self._gpsd.toff_armed and math.isfinite(data.toff_armed_offset):
             with self._ui_guard("#btn-arm-toff"):
-                btn = self.query_one("#btn-arm-toff", Button)
+                btn = self._arm_toff_button
                 if btn.variant == "success":
-                    offset_ms = self._gps_data.toff_armed_offset * 1000
+                    offset_ms = data.toff_armed_offset * 1000
                     btn.variant = "warning"
                     btn.label = f"Arm TOFF (delta: {offset_ms:+.1f} ms)"
 
-        widget_ids = [
-            "w-fix", "w-velocity", "w-skyplot", "w-signal",
-            "w-errors", "w-device", "w-time",
-            "w-constellations", "w-sattable", "w-time-detail", "w-device-detail",
-            "w-device-config",
-        ]
-        for wid in widget_ids:
-            with self._ui_guard(f"#{wid}"):
-                widget = self.query_one(f"#{wid}")
+        # DeviceConfig needs the latest data even when hidden (GPS time for
+        # clock set, device path); its update_gps_data does not render.
+        with self._ui_guard("#w-device-config"):
+            self._device_config.update_gps_data(data)
+
+        active = self._tabs.active
+        self._refresh_tab(active)
+        if heartbeat and active == "tab-nmea":
+            with self._ui_guard("#w-nmea"):
+                self._nmea_viewer._update_stats()  # the sentence rate decays over time
+
+    def _refresh_tab(self, tab: str) -> None:
+        """Update the widgets on one tab with the current data and settings."""
+        data = self._gps_data
+        for widget in self._tab_widgets.get(tab, ()):
+            with self._ui_guard(f"#{widget.id}"):
+                if isinstance(widget, PositionPanel):
+                    widget.set_hold_data(self._hold.result if self._hold.is_active else None)
                 if hasattr(widget, "units"):
                     widget.units = self._units
                 if hasattr(widget, "coord_format"):
                     widget.coord_format = self._coord_format
-                if hasattr(widget, "update_gps_data"):
-                    widget.update_gps_data(self._gps_data)
+                widget.update_gps_data(data)
+
+    def on_tabbed_content_tab_activated(self, event: TabbedContent.TabActivated) -> None:
+        """Show the latest data as soon as a tab becomes visible."""
+        if event.tabbed_content is not self._tabs or event.pane is None:
+            return
+        self._refresh_tab(event.pane.id)
 
     def _heartbeat(self) -> None:
         """Periodic refresh for staleness detection and clock updates."""
-        self._refresh_ui()
+        self._refresh_ui(heartbeat=True)
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         btn_id = event.button.id
@@ -363,7 +412,7 @@ class TuiGPS(App):
         self._gpsd.arm_toff()
         self._gps_data = self._gpsd.data
         with self._ui_guard("#btn-arm-toff"):
-            btn = self.query_one("#btn-arm-toff", Button)
+            btn = self._arm_toff_button
             btn.variant = "success"
             btn.label = "ARMED — waiting..."
         self.notify("TOFF armed — waiting for next GPS message", timeout=2)
@@ -373,7 +422,7 @@ class TuiGPS(App):
         self._gpsd.clear_toff()
         self._gps_data = self._gpsd.data
         with self._ui_guard("#btn-arm-toff"):
-            btn = self.query_one("#btn-arm-toff", Button)
+            btn = self._arm_toff_button
             btn.variant = "warning"
             btn.label = "Arm TOFF"
         self._refresh_ui()
@@ -453,6 +502,7 @@ class TuiGPS(App):
         else:
             path = self._gps_logger.start()
             self.notify(f"Logging to {path}", timeout=3)
+        self._refresh_ui()
 
     def action_toggle_hold(self) -> None:
         """Toggle position hold/averaging."""
@@ -465,6 +515,7 @@ class TuiGPS(App):
         else:
             self._hold.start()
             self.notify("Position hold started — accumulating fixes", timeout=3)
+        self._refresh_ui()
 
     def action_reconnect(self) -> None:
         """Force reconnection to gpsd."""

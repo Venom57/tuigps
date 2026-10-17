@@ -495,3 +495,42 @@ async def test_nmea_viewer_stats(monkeypatch):
         assert str(stats.render()) == "10 sentences  2.0/s"
         now["t"] = 200.0
         assert viewer.stats_text() == "10 sentences  0.0/s"
+
+
+async def test_nmea_viewer_batch_matches_single_appends():
+    """P5: a batch gives the same log, counts and stats as one-by-one appends."""
+    batch = ["$GPGGA,1*00", "$GPRMC,2*00", "$GPGSV,3*00", "$GPGGA,4*00", "bogus"]
+    single, batched = NMEAViewer(id="single"), NMEAViewer(id="batched")
+
+    class Both(App):
+        def compose(self):
+            yield single
+            yield batched
+
+    async with Both().run_test(size=(120, 40)) as pilot:
+        await pilot.pause()
+        for s in batch:
+            single.append_nmea(s)
+        batched.append_nmea_batch(batch)
+        batched.append_nmea_batch([])  # no-op
+        await pilot.pause()
+        for v in (single, batched):
+            assert _log_lines(v.query_one("#nmea-log", RichLog)) == batch
+        assert batched._total == single._total == 5
+        assert batched._type_counts == single._type_counts
+        assert list(batched._buffer) == list(single._buffer)
+        assert batched.stats_text().split("  ")[0] == "5 sentences"
+
+        # Filtered and paused batches
+        await _press(pilot, batched, "btn-nmea-gga")
+        assert _log_lines(batched.query_one("#nmea-log", RichLog)) == ["$GPGGA,1*00", "$GPGGA,4*00"]
+        batched.append_nmea_batch(["$GPRMC,5*00", "$GPGGA,6*00"])
+        await pilot.pause()
+        assert _log_lines(batched.query_one("#nmea-log", RichLog))[-1] == "$GPGGA,6*00"
+        await _press(pilot, batched, "btn-nmea-pause")
+        batched.append_nmea_batch(["$GPGGA,7*00", "$GPRMC,8*00", "$GPGGA,9*00"])
+        assert batched._pending == 3
+        assert "PAUSED (3 buffered)" in batched.stats_text()
+        await _press(pilot, batched, "btn-nmea-pause")
+        assert _log_lines(batched.query_one("#nmea-log", RichLog))[-2:] == ["$GPGGA,7*00", "$GPGGA,9*00"]
+        assert batched._type_counts["GGA"] == 5 and batched._total == 10

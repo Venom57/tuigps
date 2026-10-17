@@ -7,6 +7,7 @@ import time
 
 from rich.style import Style
 from rich.text import Text
+from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..constants import GNSS_SHORT, MODE_NAMES, STATUS_COLORS, STATUS_NAMES
@@ -37,15 +38,19 @@ class ConnectionStatus(Static):
         ("h", "Hold"),
     ]
 
+    # Activity badges: changing one repaints the bar
+    logging_active = reactive(False)
+    log_count = reactive(0)
+    hold_active = reactive(False)
+    hold_count = reactive(0)
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._data: GPSData | None = None
-        self.logging_active = False
-        self.log_count = 0
-        self.hold_active = False
-        self.hold_count = 0
 
     def update_gps_data(self, data: GPSData) -> None:
+        if data is self._data:
+            return  # same immutable snapshot: nothing new to draw
         self._data = data
         self.refresh()
 

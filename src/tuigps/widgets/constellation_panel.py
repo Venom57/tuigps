@@ -26,6 +26,8 @@ class ConstellationPanel(Static):
         self._data: GPSData | None = None
 
     def update_gps_data(self, data: GPSData) -> None:
+        if data is self._data:
+            return  # same immutable snapshot: nothing new to draw
         self._data = data
         self.refresh()
 
