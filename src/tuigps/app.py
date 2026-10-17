@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import logging
 import math
+import threading
+import time
 import webbrowser
+from collections import deque
 from contextlib import contextmanager
 
 from textual.app import App, ComposeResult
@@ -34,6 +37,13 @@ from .widgets.time_panel import TimePanel
 from .widgets.velocity_panel import VelocityPanel
 
 log = logging.getLogger(__name__)
+
+# Coalesced UI updates: the gpsd thread never waits for the UI. It stores the
+# latest snapshot (and queues NMEA sentences) and schedules at most one pending
+# UI tick; ticks run at most UI_REFRESH_HZ times per second.
+UI_REFRESH_HZ = 10.0
+UI_MIN_INTERVAL = 1.0 / UI_REFRESH_HZ
+NMEA_QUEUE_MAX = 5000  # sentences buffered between UI ticks (oldest dropped)
 
 
 class TuiGPS(App):
@@ -71,6 +81,13 @@ class TuiGPS(App):
         self._armed_clock_set = False
         self._last_tpv_seq = 0  # GPSData.tpv_seq last fed to hold/logger
         self._conn_state = ""  # last GPSData.connection_state seen
+        # Cross-thread delivery (see _schedule_tick / _ui_tick)
+        self._tick_lock = threading.Lock()
+        self._tick_pending = False  # a UI tick is scheduled and has not run yet
+        self._data_dirty = False  # _gps_data changed since the last tick
+        self._nmea_queue: deque[str] = deque(maxlen=NMEA_QUEUE_MAX)
+        self._last_tick = 0.0  # time.monotonic() of the last UI tick
+        self._tick_handle = None  # asyncio TimerHandle of a delayed tick
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -120,8 +137,85 @@ class TuiGPS(App):
         # Heartbeat refresh (catches staleness even without gpsd updates)
         self.set_interval(1.0, self._heartbeat)
 
+    # ─── Cross-thread delivery ──────────────────────────────────
+
+    def _call_soon(self, callback, *args) -> bool:
+        """Run ``callback(*args)`` on the UI event loop without waiting for it.
+
+        Thread-safe and non-blocking (unlike ``App.call_from_thread``, which
+        waits for the callback to finish). Returns False if the app is not
+        running (startup/shutdown).
+        """
+        loop = self._loop
+        if loop is None or not self.is_running:
+            return False
+        try:
+            loop.call_soon_threadsafe(self._run_ui_callback, callback, args)
+        except RuntimeError:  # event loop closed during shutdown
+            log.debug("UI delivery dropped: event loop closed")
+            return False
+        return True
+
+    def _run_ui_callback(self, callback, args) -> None:
+        """Run a scheduled callback on the UI loop, with the app context set."""
+        if self._closing or not self.is_running:
+            return
+        with self._context():
+            try:
+                callback(*args)
+            except Exception:
+                log.exception("UI callback failed: %r", callback)
+
+    def _schedule_tick(self) -> None:
+        """Ask for a UI tick (thread-safe); at most one is ever pending."""
+        with self._tick_lock:
+            if self._tick_pending:
+                return
+            self._tick_pending = True
+        if not self._call_soon(self._start_tick):
+            with self._tick_lock:
+                self._tick_pending = False
+
+    def _start_tick(self) -> None:
+        """Run the requested tick now, or once the minimum interval has passed."""
+        delay = self._last_tick + UI_MIN_INTERVAL - time.monotonic()
+        if delay <= 0:
+            self._ui_tick()
+        else:
+            self._tick_handle = self._loop.call_later(
+                delay, self._run_ui_callback, self._ui_tick, ()
+            )
+
+    def _ui_tick(self) -> None:
+        """Deliver everything the gpsd thread produced since the last tick."""
+        self._tick_handle = None
+        self._last_tick = time.monotonic()
+        # Clear the flags before reading the data: anything that arrives from
+        # now on schedules another tick, so the final state is always shown.
+        with self._tick_lock:
+            self._tick_pending = False
+        self._drain_nmea()
+        if self._data_dirty:
+            self._data_dirty = False
+            self._refresh_ui()
+
+    def _drain_nmea(self) -> None:
+        """Hand all queued NMEA sentences to the viewer in one batch."""
+        queue = self._nmea_queue
+        if not queue:
+            return
+        batch = []
+        try:
+            while True:
+                batch.append(queue.popleft())
+        except IndexError:
+            pass
+        self._deliver_nmea_batch(batch)
+
+    # ─── gpsd callbacks (run on the gpsd thread) ─────────────────
+
     def _on_gpsd_update(self, data: GPSData) -> None:
-        """Called from the gpsd thread — marshal to Textual event loop."""
+        """Called from the gpsd thread: store the snapshot, never block on the UI."""
         self._gps_data = data
 
         # Announce (re)connection once per transition into "connected"
@@ -129,12 +223,9 @@ class TuiGPS(App):
         if state != self._conn_state:
             self._conn_state = state
             if state == "connected":
-                try:
-                    self.call_from_thread(
-                        self.notify, f"Connected to gpsd {self._gpsd.server}", timeout=3
-                    )
-                except RuntimeError:
-                    pass  # app not running (startup/shutdown)
+                self._call_soon(
+                    self._notify, f"Connected to gpsd {self._gpsd.server}", {"timeout": 3}
+                )
 
         # Every message (SKY, PPS, NMEA...) re-delivers the current fix; only
         # a new TPV epoch is a new fix for clock sync, logging and hold.
@@ -142,10 +233,11 @@ class TuiGPS(App):
             self._last_tpv_seq = data.tpv_seq
             self._on_new_tpv(data)
 
-        try:
-            self.call_from_thread(self._refresh_ui)
-        except RuntimeError:
-            pass  # app not running (startup/shutdown)
+        self._data_dirty = True
+        self._schedule_tick()
+
+    def _notify(self, message: str, kwargs: dict) -> None:
+        self.notify(message, **kwargs)
 
     def _on_new_tpv(self, data: GPSData) -> None:
         """Consume one TPV epoch (on the gpsd thread)."""
@@ -157,10 +249,7 @@ class TuiGPS(App):
                 msg = set_clock_from_gps(data.time, data.tpv_received)
             except Exception as e:
                 msg = f"Clock sync error: {e}"
-            try:
-                self.call_from_thread(self._deliver_clock_result, msg)
-            except RuntimeError:
-                pass
+            self._call_soon(self._deliver_clock_result, msg)
 
         # Log and hold in the callback (already on gpsd thread, but data is fresh)
         if self._gps_logger.is_active:
@@ -173,17 +262,12 @@ class TuiGPS(App):
 
         The client reports each outage once (not every reconnect attempt).
         """
-        try:
-            self.call_from_thread(self.notify, f"gpsd: {error}", severity="error", timeout=5)
-        except RuntimeError:
-            pass  # app not running (startup/shutdown)
+        self._call_soon(self._notify, f"gpsd: {error}", {"severity": "error", "timeout": 5})
 
     def _on_nmea(self, sentence: str) -> None:
-        """Called from the gpsd thread with raw NMEA sentences."""
-        try:
-            self.call_from_thread(self._deliver_nmea, sentence)
-        except RuntimeError:
-            pass  # app not running (startup/shutdown)
+        """Called from the gpsd thread with raw NMEA sentences (queued, batched)."""
+        self._nmea_queue.append(sentence)
+        self._schedule_tick()
 
     @contextmanager
     def _ui_guard(self, what: str):
@@ -211,11 +295,12 @@ class TuiGPS(App):
             timeout=4,
         )
 
-    def _deliver_nmea(self, sentence: str) -> None:
-        """Deliver NMEA sentence to the viewer widget (on Textual thread)."""
+    def _deliver_nmea_batch(self, sentences: list[str]) -> None:
+        """Deliver queued NMEA sentences to the viewer widget (on Textual thread)."""
         with self._ui_guard("#w-nmea"):
             viewer = self.query_one("#w-nmea", NMEAViewer)
-            viewer.append_nmea(sentence)
+            for sentence in sentences:
+                viewer.append_nmea(sentence)
 
     def _refresh_ui(self) -> None:
         """Push current GPS data to all widgets."""
@@ -397,6 +482,9 @@ class TuiGPS(App):
 
     def on_unmount(self) -> None:
         """Clean up on exit."""
+        if self._tick_handle is not None:
+            self._tick_handle.cancel()
+            self._tick_handle = None
         self._gps_logger.stop()
         self._gpsd.stop()
 

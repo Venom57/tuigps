@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import math
 import threading
+import time
 
 import pytest
 from textual.widgets import Button, Input, RichLog, Select, TabbedContent
@@ -56,6 +57,20 @@ def _no_browser(monkeypatch):
 @pytest.fixture
 def opened_urls(_no_browser):
     return _no_browser
+
+
+async def settle(pilot, app: TuiGPS, timeout: float = 2.0) -> None:
+    """Wait until updates posted from other threads have reached the widgets.
+
+    gpsd updates are delivered without blocking and coalesced into rate-limited
+    UI ticks, so they land a little after the producer call returns.
+    """
+    await pilot.pause()
+    for _ in range(int(timeout / 0.02)):
+        if not app._tick_pending:
+            break
+        await pilot.pause(0.02)
+    await pilot.pause()
 
 
 def render_all(app: TuiGPS) -> dict[str, str]:
@@ -182,7 +197,7 @@ async def test_gpsd_update_from_thread(make_gps_data):
     async with app.run_test(size=SIZE) as pilot:
         data = make_gps_data()
         await asyncio.to_thread(app._on_gpsd_update, data)
-        await pilot.pause()
+        await settle(pilot, app)
         assert app._gps_data is data
         assert "47.606200" in app.query_one("#w-position").render().plain
 
@@ -192,6 +207,7 @@ async def test_nmea_and_error_from_thread():
     async with app.run_test(size=SIZE) as pilot:
         await asyncio.to_thread(app._on_nmea, "$GPGGA,123*00")
         await asyncio.to_thread(app._on_gpsd_error, "boom")
+        await settle(pilot, app)
         app.query_one(TabbedContent).active = "tab-nmea"
         await pilot.pause()
         log = app.query_one(NMEAViewer).query_one("#nmea-log", RichLog)
@@ -224,7 +240,7 @@ async def test_key_hold(make_gps_data):
         assert app._hold.is_active
         data = make_gps_data()
         await asyncio.to_thread(app._on_gpsd_update, data)
-        await pilot.pause()
+        await settle(pilot, app)
         assert app._hold.fix_count >= 1
         assert "Hold (" in app.query_one("#w-position").render().plain
         assert "HOLD" in app.query_one("#w-connection").render().plain
@@ -240,7 +256,7 @@ async def test_key_log_writes_into_cwd(tmp_path, monkeypatch, make_gps_data):
         assert app._gps_logger.is_active
         path = app._gps_logger.filepath
         await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
-        await pilot.pause()
+        await settle(pilot, app)
         assert app._gps_logger.fix_count == 1
         assert "REC" in app.query_one("#w-connection").render().plain
         await pilot.press("l")
@@ -409,7 +425,7 @@ async def test_armed_clock_sync_fires_on_update(make_gps_data, monkeypatch):
         data = make_gps_data(tpv_seq=1)
         data.tpv_received = data.last_seen - 0.5
         await asyncio.to_thread(app._on_gpsd_update, data)
-        await pilot.pause()
+        await settle(pilot, app)
         assert not app._armed_clock_set
         btn = app.query_one("#btn-arm-clock", Button)
         assert str(btn.label) == "Arm Clock Sync"
@@ -427,7 +443,7 @@ async def test_armed_clock_sync_error_is_reported(make_gps_data, monkeypatch):
         await pilot.pause()
         app._armed_clock_set = True
         await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
-        await pilot.pause()
+        await settle(pilot, app)
         out = app.query_one(DeviceConfig).query_one("#config-output", RichLog)
         text = "\n".join("".join(seg.text for seg in strip) for strip in out.lines)
         assert "Clock sync error: bad time" in text
@@ -523,8 +539,114 @@ async def test_refresh_with_modal_open_is_silent(make_gps_data, caplog):
         assert isinstance(app.screen, SettingsScreen)
         app._gps_data = make_gps_data()
         app._refresh_ui()
-        app._deliver_nmea("$GPGGA,1*00")
+        app._deliver_nmea_batch(["$GPGGA,1*00"])
         app._deliver_clock_result("System clock set to: x")
         await pilot.pause()
         assert app.is_running
     assert not [r for r in caplog.records if r.name.startswith("tuigps")]
+
+
+# ─── Non-blocking, coalesced delivery (P1/P2) ─────────────────────────
+
+
+async def test_gpsd_thread_never_waits_for_the_ui(make_gps_data, monkeypatch):
+    """P2: a slow UI refresh must not block the gpsd reader thread."""
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        refreshes = []
+        original = app._refresh_ui
+
+        def slow_refresh(*args, **kwargs):
+            refreshes.append(app._gps_data)
+            time.sleep(0.2)  # a pathologically slow UI
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(app, "_refresh_ui", slow_refresh)
+        snapshots = [make_gps_data(tpv_seq=i, latitude=10.0 + i) for i in range(1, 51)]
+
+        def produce():
+            start = time.perf_counter()
+            for d in snapshots:
+                app._on_gpsd_update(d)
+                app._on_nmea("$GPGGA,x*00")
+            return time.perf_counter() - start
+
+        elapsed = await asyncio.to_thread(produce)
+        assert elapsed < 0.15  # 50 updates + 50 sentences, never waiting on a 0.2 s refresh
+        await settle(pilot, app, timeout=3.0)
+        # Coalesced: far fewer refreshes than updates, and the last one shows the final state
+        assert 1 <= len(refreshes) <= 4
+        assert refreshes[-1] is snapshots[-1]
+        assert "60.000000" in app.query_one("#w-position").render().plain
+
+
+async def test_rapid_updates_are_coalesced_with_trailing_refresh(make_gps_data, monkeypatch):
+    """P1: updates within one refresh interval produce one more refresh, with the last data."""
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        shown = []
+        original = app._refresh_ui
+
+        def counting(*args, **kwargs):
+            shown.append(app._gps_data)
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(app, "_refresh_ui", counting)
+        first, second, third = (make_gps_data(tpv_seq=i) for i in (1, 2, 3))
+        await asyncio.to_thread(app._on_gpsd_update, first)  # leading edge: immediate
+        await pilot.pause()
+        await asyncio.to_thread(app._on_gpsd_update, second)  # within the interval:
+        await asyncio.to_thread(app._on_gpsd_update, third)  # coalesced, trailing edge
+        await settle(pilot, app)
+        assert shown[0] is first
+        assert shown[-1] is third
+        assert len(shown) <= 3  # first, one coalesced trailing refresh (+ maybe a heartbeat)
+
+
+async def test_delivery_errors_during_shutdown_are_swallowed(make_gps_data, caplog):
+    """A closed event loop (app shutting down) must not raise on the gpsd thread."""
+
+    class ClosedLoop:
+        def call_soon_threadsafe(self, *args):
+            raise RuntimeError("Event loop is closed")
+
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        loop = app._loop
+        app._loop = ClosedLoop()
+        try:
+            app._conn_state = ""
+            await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
+            await asyncio.to_thread(app._on_nmea, "$GPGGA,1*00")
+            await asyncio.to_thread(app._on_gpsd_error, "boom")
+            assert not app._tick_pending  # a later update can schedule again
+        finally:
+            app._loop = loop
+
+
+async def test_producer_running_across_shutdown_is_safe(make_gps_data):
+    errors: list[BaseException] = []
+    stop = threading.Event()
+    app = TuiGPS()
+
+    def produce():
+        data = make_gps_data()
+        try:
+            while not stop.is_set():
+                app._on_gpsd_update(data)
+                app._on_nmea("$GPGGA,1*00")
+                time.sleep(0.001)
+        except BaseException as e:  # pragma: no cover - asserted below
+            errors.append(e)
+
+    thread = threading.Thread(target=produce)
+    async with app.run_test(size=SIZE) as pilot:
+        thread.start()
+        await pilot.pause(0.15)
+    await asyncio.sleep(0.1)  # keep producing after the app has stopped
+    stop.set()
+    thread.join(2)
+    assert errors == []
+    assert app._tick_handle is None
