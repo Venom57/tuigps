@@ -10,6 +10,7 @@ import webbrowser
 from collections import deque
 from contextlib import contextmanager
 
+from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -20,7 +21,7 @@ from textual.widgets import Button, Header, TabbedContent, TabPane
 from . import config as config_mod
 from .clock_sync import set_clock_from_gps
 from .config import Config
-from .data_model import GPSData
+from .data_model import GPSData, staleness
 from .formatting import fmt_distance
 from .gps_logger import GPSLogger
 from .gpsd_client import GPSDClient
@@ -173,6 +174,8 @@ class TuiGPS(App):
         self._nmea_viewer: NMEAViewer | None = None
         self._arm_toff_button: Button | None = None
         self._dashboard_layout = ""  # current DASHBOARD_LAYOUTS class
+        self._data_panels: list = []  # every widget in TAB_WIDGETS (stale tagging)
+        self._stale_tag = ""  # staleness() of the data the panels show
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -240,6 +243,7 @@ class TuiGPS(App):
         self._tab_widgets = {
             tab: [self.query_one(f"#{wid}") for wid in ids] for tab, ids in TAB_WIDGETS.items()
         }
+        self._data_panels = [w for widgets in self._tab_widgets.values() for w in widgets]
         self._tabs = self.query_one(TabbedContent)
         self._status_bar = self.query_one("#w-connection", ConnectionStatus)
         self._device_config = self.query_one("#w-device-config", DeviceConfig)
@@ -494,11 +498,28 @@ class TuiGPS(App):
         with self._ui_guard("#w-device-config"):
             self._device_config.update_gps_data(data)
 
+        self._update_staleness()
         active = self._tabs.active
         self._refresh_tab(active)
         if heartbeat and active == "tab-nmea":
             with self._ui_guard("#w-nmea"):
                 self._nmea_viewer._update_stats()  # the sentence rate decays over time
+
+    def _update_staleness(self) -> None:
+        """Dim the data panels and tag their titles while the data is not live.
+
+        Runs on every refresh and heartbeat: the tag counts up while the data
+        ages and clears as soon as fresh data arrives.
+        """
+        tag = staleness(self._gps_data)
+        if tag == self._stale_tag:
+            return
+        self._stale_tag = tag
+        title = Text(f"[{tag}]") if tag else ""  # Text: brackets are not markup
+        for panel in self._data_panels:
+            with self._ui_guard(f"stale #{panel.id}"):
+                panel.set_class(bool(tag), "stale")
+                panel.border_title = title
 
     def _refresh_tab(self, tab: str) -> None:
         """Update the widgets on one tab with the current data and settings."""

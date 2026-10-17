@@ -79,6 +79,16 @@ TabPane {
 }
 
 
+/* ─── Stale or disconnected data (set by TuiGPS._update_staleness) ─── */
+
+.stale {
+    color: $text-muted;  /* text without its own color */
+    text-opacity: 50%;  /* colored text */
+    border-title-color: $warning;
+    border-title-style: bold;
+}
+
+
 /* ─── Satellites tab ─── */
 
 #satellites-container {

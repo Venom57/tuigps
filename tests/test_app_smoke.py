@@ -589,9 +589,10 @@ async def test_rapid_updates_are_coalesced_with_trailing_refresh(make_gps_data, 
         shown = []
         original = app._refresh_ui
 
-        def counting(*args, **kwargs):
-            shown.append(app._gps_data)
-            original(*args, **kwargs)
+        def counting(*args, heartbeat=False, **kwargs):
+            if not heartbeat:  # heartbeats are timer-driven, not data deliveries
+                shown.append(app._gps_data)
+            original(*args, heartbeat=heartbeat, **kwargs)
 
         monkeypatch.setattr(app, "_refresh_ui", counting)
         first, second, third = (make_gps_data(tpv_seq=i) for i in (1, 2, 3))
@@ -602,7 +603,7 @@ async def test_rapid_updates_are_coalesced_with_trailing_refresh(make_gps_data, 
         await settle(pilot, app)
         assert shown[0] is first
         assert shown[-1] is third
-        assert len(shown) <= 3  # first, one coalesced trailing refresh (+ maybe a heartbeat)
+        assert len(shown) <= 2  # first, then one coalesced trailing refresh
 
 
 async def test_delivery_errors_during_shutdown_are_swallowed(make_gps_data, caplog):
