@@ -148,10 +148,38 @@ def test_missing_altitude_does_not_affect_horizontal_stats():
     assert r.mean_lon == pytest.approx(3.0)
 
 
-@pytest.mark.xfail(strict=True, reason="F12: altitude mean divides by total fix count, not altitude count")
 def test_altitude_mean_ignores_fixes_without_altitude():
+    """F12: altitude statistics use their own count."""
     h = PositionHold()
     h.start()
     h.add_fix(1.0, 2.0, NAN)
     h.add_fix(1.0, 2.0, 100.0)
-    assert h.result.mean_alt == pytest.approx(100.0)
+    r = h.result
+    assert r.fix_count == 2
+    assert r.mean_alt == pytest.approx(100.0)
+    assert math.isnan(r.std_alt)  # only one altitude sample
+    h.add_fix(1.0, 2.0, NAN)
+    h.add_fix(1.0, 2.0, 102.0)
+    r = h.result
+    assert r.mean_alt == pytest.approx(101.0)
+    assert r.std_alt == pytest.approx(statistics.stdev([100.0, 102.0]))
+
+
+def test_no_altitude_at_all_gives_nan_mean():
+    h = PositionHold()
+    h.start()
+    h.add_fix(1.0, 2.0, NAN)
+    assert math.isnan(h.result.mean_alt)
+    h.add_fix(1.0, 2.0, NAN)
+    r = h.result
+    assert math.isnan(r.mean_alt) and math.isnan(r.std_alt)
+    assert r.std_north == 0.0 and r.cep50 == 0.0
+
+
+def test_restart_resets_altitude_count():
+    h = PositionHold()
+    h.start()
+    h.add_fix(1.0, 2.0, 50.0)
+    h.start()
+    h.add_fix(1.0, 2.0, NAN)
+    assert math.isnan(h.result.mean_alt)

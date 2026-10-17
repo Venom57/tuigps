@@ -89,8 +89,12 @@ class ConnectionStatus(Static):
             return txt
 
         d = self._data
-        age = time.time() - d.last_seen if d.last_seen > 0 else 999
+        if d.last_seen <= 0:
+            # Connected, but no report received yet
+            txt.append(" WAITING ", style=Style(color="black", bgcolor="yellow", bold=True))
+            return txt
 
+        age = time.time() - d.last_seen
         if age > 10:
             txt.append(f" STALE ({int(age)}s) ", style=Style(color="black", bgcolor="yellow", bold=True))
             return txt

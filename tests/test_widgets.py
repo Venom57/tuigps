@@ -281,12 +281,14 @@ async def test_connection_status_badges_and_stale(make_gps_data):
 
 
 async def test_connection_status_connected_never_seen():
-    """Characterization: connected but no message yet renders as STALE (999s)."""
+    """N7: connected but no message yet renders as WAITING, not STALE (999s)."""
     bar = ConnectionStatus()
     app = Harness(bar)
     async with app.run_test(size=(200, 10)):
         bar.update_gps_data(GPSData(connected=True))
-        assert "STALE (999s)" in bar.render().plain
+        plain = bar.render().plain
+        assert "WAITING" in plain
+        assert "STALE" not in plain
 
 
 async def test_sky_plot_skips_below_horizon_and_nan():

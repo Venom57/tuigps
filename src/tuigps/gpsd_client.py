@@ -242,6 +242,8 @@ class GPSDClient:
 
     def _extract_tpv(self, s, d: GPSData) -> None:
         """Extract TPV (Time-Position-Velocity) data."""
+        d.tpv_seq += 1
+        d.tpv_received = self._receipt_time or time.time()
         f = s.fix
         d.latitude = self._safe_float(f.latitude)
         d.longitude = self._safe_float(f.longitude)

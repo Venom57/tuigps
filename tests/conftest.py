@@ -293,9 +293,12 @@ def make_gps_data():
 
     def _make(**overrides: Any) -> GPSData:
         sats = sample_satellites()
+        now = time.time()
         d = GPSData(
             connected=True,
-            last_seen=time.time(),
+            last_seen=now,
+            tpv_seq=1,
+            tpv_received=now,
             latitude=47.6062,
             longitude=-122.3321,
             alt_hae=30.5,

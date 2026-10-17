@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import math
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .data_model import GPSData
+
+# GPX 1.1 has no speed element; the Garmin TrackPointExtension v2 does.
+GPXTPX_NS = "http://www.garmin.com/xmlschemas/TrackPointExtension/v2"
 
 
 class GPSLogger:
@@ -22,6 +26,8 @@ class GPSLogger:
         self._start_time = 0.0
         self._filepath: Path | None = None
         self._last_time = ""
+        # log_point() runs on the gpsd thread, start()/stop() on the UI thread
+        self._lock = threading.Lock()
 
     @property
     def is_active(self) -> bool:
@@ -41,12 +47,29 @@ class GPSLogger:
             return 0.0
         return time.time() - self._start_time
 
-    def start(self) -> Path:
-        """Start logging. Returns the file path."""
+    def _open_new_file(self) -> None:
+        """Create a new log file, never overwriting an existing one."""
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         ext = self._format
-        self._filepath = self._directory / f"tuigps_{ts}.{ext}"
-        self._file = open(self._filepath, "w")
+        suffix = 0
+        while True:
+            name = f"tuigps_{ts}.{ext}" if suffix == 0 else f"tuigps_{ts}_{suffix}.{ext}"
+            path = self._directory / name
+            try:
+                self._file = open(path, "x")
+            except FileExistsError:
+                suffix += 1
+                continue
+            self._filepath = path
+            return
+
+    def start(self) -> Path:
+        """Start logging. Returns the file path."""
+        with self._lock:
+            return self._start()
+
+    def _start(self) -> Path:
+        self._open_new_file()
         self._active = True
         self._count = 0
         self._start_time = time.time()
@@ -56,7 +79,8 @@ class GPSLogger:
             self._file.write(
                 '<?xml version="1.0" encoding="UTF-8"?>\n'
                 '<gpx version="1.1" creator="tuigps"\n'
-                '     xmlns="http://www.topografix.com/GPX/1/1">\n'
+                '     xmlns="http://www.topografix.com/GPX/1/1"\n'
+                f'     xmlns:gpxtpx="{GPXTPX_NS}">\n'
                 "  <trk>\n"
                 "    <name>tuigps log</name>\n"
                 "    <trkseg>\n"
@@ -71,6 +95,10 @@ class GPSLogger:
 
     def stop(self) -> None:
         """Stop logging and close the file."""
+        with self._lock:
+            self._stop()
+
+    def _stop(self) -> None:
         if not self._active:
             return
         if self._file:
@@ -87,14 +115,19 @@ class GPSLogger:
 
     def log_point(self, data: GPSData) -> None:
         """Log a single GPS fix."""
+        with self._lock:
+            self._log_point(data)
+
+    def _log_point(self, data: GPSData) -> None:
         if not self._active or not self._file:
             return
         if not data.has_fix:
             return
-        # Deduplicate by timestamp
-        if data.time == self._last_time:
-            return
-        self._last_time = data.time
+        # Deduplicate by timestamp (a fix without a timestamp can't be a repeat)
+        if data.time:
+            if data.time == self._last_time:
+                return
+            self._last_time = data.time
 
         if self._format == "gpx":
             self._write_gpx_point(data)
@@ -104,14 +137,27 @@ class GPSLogger:
         self._file.flush()
 
     def _write_gpx_point(self, d: GPSData) -> None:
+        # Child order follows the GPX 1.1 wptType sequence:
+        # ele, time, ..., sat, hdop, vdop, pdop, ..., extensions
         alt = f"      <ele>{d.alt_msl:.1f}</ele>\n" if math.isfinite(d.alt_msl) else ""
         time_str = f"      <time>{d.time}</time>\n" if d.time else ""
-        speed = f"      <speed>{d.speed:.2f}</speed>\n" if math.isfinite(d.speed) else ""
-        hdop = f"      <hdop>{d.dop.hdop:.1f}</hdop>\n" if math.isfinite(d.dop.hdop) else ""
+        sat = f"      <sat>{d.satellites_used}</sat>\n" if d.satellites_used > 0 else ""
+        dops = "".join(
+            f"      <{name}>{value:.1f}</{name}>\n"
+            for name, value in (("hdop", d.dop.hdop), ("vdop", d.dop.vdop), ("pdop", d.dop.pdop))
+            if math.isfinite(value)
+        )
+        ext = ""
+        if math.isfinite(d.speed):
+            ext = (
+                "      <extensions><gpxtpx:TrackPointExtension>"
+                f"<gpxtpx:speed>{d.speed:.2f}</gpxtpx:speed>"
+                "</gpxtpx:TrackPointExtension></extensions>\n"
+            )
 
         self._file.write(
             f'    <trkpt lat="{d.latitude:.8f}" lon="{d.longitude:.8f}">\n'
-            f"{alt}{time_str}{speed}{hdop}"
+            f"{alt}{time_str}{sat}{dops}{ext}"
             f"    </trkpt>\n"
         )
 

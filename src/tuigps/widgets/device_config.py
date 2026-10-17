@@ -350,13 +350,13 @@ class DeviceConfig(Vertical):
             return
 
         gps_time = self._data.time
-        last_seen = self._data.last_seen
-        fix_age = time.time() - last_seen if last_seen > 0 else 0.0
+        received = self._data.tpv_received  # receipt time of the TPV, not any message
+        fix_age = time.time() - received if received > 0 else 0.0
         self._append_output(f"Setting system clock now: {gps_time} (fix age: {fix_age:.1f}s)")
 
         def run():
             try:
-                msg = set_clock_from_gps(gps_time, last_seen)
+                msg = set_clock_from_gps(gps_time, received)
                 self.app.call_from_thread(self._append_output, msg)
             except Exception as e:
                 self.app.call_from_thread(self._append_output, f"Error: {e}")
@@ -401,7 +401,7 @@ class DeviceConfig(Vertical):
         4. Apply relative adjustment via D-Bus SetTime
         The delay between ioctl return and SetTime cancels out mathematically.
         """
-        if not self._data or not self._data.time:
+        if not self._data or not self._data.time or self._data.tpv_received <= 0:
             self._append_output("Error: no GPS time available for PPS sync")
             return
 
@@ -418,14 +418,15 @@ class DeviceConfig(Vertical):
         if gps_epoch is None:
             self._append_output(f"Error: cannot parse GPS time {gps_time_str!r}")
             return
-        last_seen = self._data.last_seen
+        # Fix age reference: receipt of the TPV that carried this time
+        received = self._data.tpv_received
         self._append_output(f"PPS sync: waiting for pulse on {pps_dev}...")
 
         def run():
             try:
 
                 # Estimate current GPS time to predict which second the pulse marks
-                elapsed = time.time() - last_seen  # true elapsed (system clock based)
+                elapsed = time.time() - received  # true elapsed (system clock based)
                 current_gps = gps_epoch + elapsed
                 # Next whole GPS second (the one the PPS pulse will mark)
                 target_sec = int(current_gps) + 1
@@ -443,7 +444,7 @@ class DeviceConfig(Vertical):
                 kern_sec, kern_nsec, seq = pps
 
                 # After pulse: refine target using post-pulse GPS time estimate
-                elapsed_after = time.time() - last_seen
+                elapsed_after = time.time() - received
                 current_gps_after = gps_epoch + elapsed_after
                 target_sec = round(current_gps_after)
 

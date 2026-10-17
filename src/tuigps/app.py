@@ -64,6 +64,7 @@ class TuiGPS(App):
         self._gps_logger = GPSLogger()
         self._hold = PositionHold()
         self._armed_clock_set = False
+        self._last_tpv_seq = 0  # GPSData.tpv_seq last fed to hold/logger
 
     def compose(self) -> ComposeResult:
         yield Header()
@@ -117,28 +118,37 @@ class TuiGPS(App):
         """Called from the gpsd thread — marshal to Textual event loop."""
         self._gps_data = data
 
+        # Every message (SKY, PPS, NMEA...) re-delivers the current fix; only
+        # a new TPV epoch is a new fix for clock sync, logging and hold.
+        if data.tpv_seq != self._last_tpv_seq:
+            self._last_tpv_seq = data.tpv_seq
+            self._on_new_tpv(data)
+
+        try:
+            self.call_from_thread(self._refresh_ui)
+        except RuntimeError:
+            pass  # app not running (startup/shutdown)
+
+    def _on_new_tpv(self, data: GPSData) -> None:
+        """Consume one TPV epoch (on the gpsd thread)."""
         # Armed clock set: fire immediately on gpsd thread for minimum latency.
         # The GPS time string is as fresh as possible — no event loop delay.
         if self._armed_clock_set and data.time:
             self._armed_clock_set = False
             try:
-                msg = set_clock_from_gps(data.time, data.last_seen)
-                self.call_from_thread(self._deliver_clock_result, msg)
+                msg = set_clock_from_gps(data.time, data.tpv_received)
             except Exception as e:
-                self.call_from_thread(
-                    self._deliver_clock_result, f"Clock sync error: {e}"
-                )
+                msg = f"Clock sync error: {e}"
+            try:
+                self.call_from_thread(self._deliver_clock_result, msg)
+            except RuntimeError:
+                pass
 
         # Log and hold in the callback (already on gpsd thread, but data is fresh)
         if self._gps_logger.is_active:
             self._gps_logger.log_point(data)
         if self._hold.is_active and data.has_fix:
             self._hold.add_fix(data.latitude, data.longitude, data.alt_msl)
-
-        try:
-            self.call_from_thread(self._refresh_ui)
-        except Exception:
-            pass
 
     def _on_gpsd_error(self, error: str) -> None:
         """Called from the gpsd thread on connection errors."""
@@ -309,6 +319,7 @@ class TuiGPS(App):
                 self._gpsd.stop()
                 self._gpsd = GPSDClient(host=new_host, port=new_port)
                 self._gps_data = self._gpsd.data
+                self._last_tpv_seq = 0
                 self._gpsd.start(
                     on_update=self._on_gpsd_update,
                     on_error=self._on_gpsd_error,
@@ -367,6 +378,7 @@ class TuiGPS(App):
         # Reset the client's data too, so the UI and the client agree
         self._gpsd.reset()
         self._gps_data = self._gpsd.data
+        self._last_tpv_seq = 0
         self._gpsd.start(
             on_update=self._on_gpsd_update,
             on_error=self._on_gpsd_error,

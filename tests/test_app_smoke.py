@@ -196,8 +196,9 @@ async def test_key_reconnect(fake_gps, make_gps_data):
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
         old_thread = app._gpsd._thread
-        app._gpsd._data = make_gps_data()  # client has a fix from the old session
-        app._gps_data = app._gpsd.data
+        app._gpsd._data = make_gps_data(tpv_seq=5)  # client has a fix from the old session
+        app._on_gpsd_update(app._gpsd.data)
+        assert app._last_tpv_seq == 5
         old_data = app._gps_data
         await pilot.press("r")
         await pilot.pause()
@@ -206,6 +207,7 @@ async def test_key_reconnect(fake_gps, make_gps_data):
         # F4: client data was reset too, so the UI and the client agree
         assert app._gps_data is app._gpsd.data
         assert not app._gps_data.has_fix
+        assert app._last_tpv_seq == 0  # the new session's first TPV (seq 1) is new
         # ...and only the new polling thread is alive
         assert not old_thread.is_alive()
         alive = [t for t in threading.enumerate() if t.name == "gpsd-client" and t.is_alive()]
@@ -301,8 +303,8 @@ async def test_arm_and_clear_toff(make_gps_data):
 async def test_armed_clock_sync_fires_on_update(make_gps_data, monkeypatch):
     calls = []
 
-    def fake_set_clock(gps_time, last_seen):
-        calls.append((gps_time, last_seen))
+    def fake_set_clock(gps_time, fix_received):
+        calls.append((gps_time, fix_received))
         return "System clock set to: fake"
 
     monkeypatch.setattr(app_module, "set_clock_from_gps", fake_set_clock)
@@ -313,13 +315,35 @@ async def test_armed_clock_sync_fires_on_update(make_gps_data, monkeypatch):
         app.query_one("#btn-arm-clock", Button).press()
         await pilot.pause()
         assert app._armed_clock_set
-        data = make_gps_data()
+        # A non-TPV message does not fire the armed sync (F1)...
+        await asyncio.to_thread(app._on_gpsd_update, make_gps_data(tpv_seq=0))
+        assert app._armed_clock_set
+        # ...the next TPV does, with the TPV receipt time as fix age reference (F2)
+        data = make_gps_data(tpv_seq=1)
+        data.tpv_received = data.last_seen - 0.5
         await asyncio.to_thread(app._on_gpsd_update, data)
         await pilot.pause()
         assert not app._armed_clock_set
         btn = app.query_one("#btn-arm-clock", Button)
         assert str(btn.label) == "Arm Clock Sync"
-    assert calls == [(data.time, data.last_seen)]
+    assert calls == [(data.time, data.tpv_received)]
+
+
+async def test_armed_clock_sync_error_is_reported(make_gps_data, monkeypatch):
+    def fake_set_clock(gps_time, fix_received):
+        raise ValueError("bad time")
+
+    monkeypatch.setattr(app_module, "set_clock_from_gps", fake_set_clock)
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app.query_one(TabbedContent).active = "tab-device"
+        await pilot.pause()
+        app._armed_clock_set = True
+        await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
+        await pilot.pause()
+        out = app.query_one(DeviceConfig).query_one("#config-output", RichLog)
+        text = "\n".join("".join(seg.text for seg in strip) for strip in out.lines)
+        assert "Clock sync error: bad time" in text
 
 
 async def test_deliver_clock_error_result():
@@ -350,11 +374,42 @@ def test_logger_dedupes_repeated_snapshot(make_gps_data, tmp_path):
     app._gps_logger.stop()
 
 
-@pytest.mark.xfail(strict=True, reason="F1: position hold adds the same fix on every message")
 def test_hold_counts_each_fix_once(make_gps_data):
+    """F1: SKY/PPS/NMEA updates re-deliver the same TPV and are not new fixes."""
     app = TuiGPS()
     app._hold.start()
     data = make_gps_data()
     for _ in range(3):  # e.g. TPV followed by SKY and PPS with the same fix
         app._on_gpsd_update(data)
     assert app._hold.fix_count == 1
+    data.tpv_seq += 1  # next TPV epoch
+    app._on_gpsd_update(data)
+    assert app._hold.fix_count == 2
+
+
+def test_hold_and_log_follow_client_tpv_epochs(fake_session, tpv_session, tmp_path):
+    """End to end through GPSDClient: one hold/log entry per TPV message."""
+    from tuigps.gpsd_client import GPSDClient
+
+    app = TuiGPS()
+    app._hold.start()
+    app._gps_logger._directory = tmp_path
+    app._gps_logger._format = "csv"
+    app._gps_logger.start()
+    client = GPSDClient()
+    client._on_update = app._on_gpsd_update
+    tpv = tpv_session()
+    times = ["2026-03-14T12:00:00Z", "2026-03-14T12:00:01Z"]
+    for t in times:
+        tpv.fix.time = t
+        tpv.data = {"class": "TPV"}
+        client._extract_data(tpv)
+        client._notify_update()
+        for cls in ("SKY", "PPS", "WATCH"):  # same fix, other message classes
+            client._extract_data(fake_session(data={"class": cls}))
+            client._notify_update()
+    app._gps_logger.stop()
+    assert client.data.tpv_seq == 2
+    assert app._hold.fix_count == 2
+    assert app._gps_logger.fix_count == 2
+

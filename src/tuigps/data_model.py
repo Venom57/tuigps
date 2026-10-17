@@ -107,8 +107,14 @@ class GPSData:
 
     # Connection state
     connected: bool = False
-    last_seen: float = 0.0
+    last_seen: float = 0.0  # time.time() of the last message of any class
     error_message: str = ""
+
+    # TPV epoch tracking: tpv_seq increments on every TPV message, so
+    # consumers can tell a new fix from a re-delivery of the same one;
+    # tpv_received is time.time() at receipt of that TPV (fix age reference).
+    tpv_seq: int = 0
+    tpv_received: float = 0.0
 
     # TPV data
     latitude: float = float("nan")

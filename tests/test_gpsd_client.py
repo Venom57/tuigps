@@ -139,7 +139,7 @@ def test_extract_data_non_dict_data(fake_session):
 
 
 def test_last_seen_updated_by_non_tpv_messages(fake_session):
-    """Characterization of F2: every message class advances last_seen."""
+    """last_seen tracks messages of any class (fix age uses tpv_received)."""
     c = _client_with(fake_session(data={"class": "SKY", "satellites": []}))
     c._extract_data()
     assert c.data.last_seen > 0
@@ -181,6 +181,23 @@ def test_extract_tpv_full(tpv_session):
     assert (d.ecefx, d.ecefy, d.ecefz) == (-2304000.1, -3638000.2, 4688000.3)
     assert (d.ecefvx, d.ecefvy, d.ecefvz) == (0.1, 0.2, 0.3)
     assert d.has_fix
+
+
+def test_tpv_epoch_tracking(tpv_session, fake_session):
+    """F1/F2: tpv_seq counts TPV messages; tpv_received is the TPV receipt time."""
+    c = _client_with(tpv_session())
+    c._receipt_time = 1000.0
+    c._extract_data()
+    assert (c.data.tpv_seq, c.data.tpv_received) == (1, 1000.0)
+    for cls in ("SKY", "PPS", "TOFF", "WATCH"):
+        c._receipt_time += 0.1
+        c._extract_data(fake_session(data={"class": cls}))
+    # Other message classes advance last_seen but not the TPV epoch
+    assert (c.data.tpv_seq, c.data.tpv_received) == (1, 1000.0)
+    assert c.data.last_seen > 1000.0
+    c._receipt_time = 1001.0
+    c._extract_data()
+    assert (c.data.tpv_seq, c.data.tpv_received) == (2, 1001.0)
 
 
 def test_extract_tpv_missing_values_are_nan(fake_session):

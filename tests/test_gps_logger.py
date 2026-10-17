@@ -10,7 +10,14 @@ import pytest
 from tuigps.data_model import GPSData
 from tuigps.gps_logger import GPSLogger
 
-GPX_NS = {"g": "http://www.topografix.com/GPX/1/1"}
+GPX_NS = {"g": "http://www.topografix.com/GPX/1/1",
+          "tpx": "http://www.garmin.com/xmlschemas/TrackPointExtension/v2"}
+
+# GPX 1.1 wptType child sequence (all optional, order is mandatory)
+WPT_SEQUENCE = [
+    "ele", "time", "magvar", "geoidheight", "name", "cmt", "desc", "src", "link", "sym",
+    "type", "fix", "sat", "hdop", "vdop", "pdop", "ageofdgpsdata", "dgpsid", "extensions",
+]
 
 
 def _gpx_points(path):
@@ -77,15 +84,16 @@ class TestGPX:
         (pt,) = _gpx_points(path)
         assert [child.tag.split("}")[1] for child in pt] == ["time"]
 
-    def test_fix_without_timestamp_is_skipped(self, tmp_path):
-        # Characterization: dedupe compares against the initial "" last-time,
-        # so a fix with an empty timestamp is never logged.
+    def test_fix_without_timestamp_is_logged(self, tmp_path):
+        """N7: dedupe only applies to fixes with a timestamp."""
         lg = GPSLogger(directory=str(tmp_path), fmt="gpx")
         path = lg.start()
         lg.log_point(GPSData(mode=2, latitude=1.0, longitude=2.0, time=""))
+        lg.log_point(GPSData(mode=2, latitude=1.5, longitude=2.0, time=""))
         lg.stop()
-        assert lg.fix_count == 0
-        assert _gpx_points(path) == []
+        assert lg.fix_count == 2
+        pts = _gpx_points(path)
+        assert len(pts) == 2 and pts[0].find("g:time", GPX_NS) is None
 
     def test_deduplicates_by_timestamp(self, tmp_path, make_gps_data):
         lg = GPSLogger(directory=str(tmp_path), fmt="gpx")
@@ -133,14 +141,83 @@ class TestGPX:
         assert lg.fix_count == 1
         lg.stop()
 
-    @pytest.mark.xfail(strict=True, reason="F6: <speed> is not a valid trkpt child in GPX 1.1")
-    def test_gpx_1_1_has_no_speed_element(self, tmp_path, make_gps_data):
+    def test_gpx_1_1_trkpt_children_are_valid_and_ordered(self, tmp_path, make_gps_data):
+        """F6: only wptType children, in schema order; speed lives in an extension."""
         lg = GPSLogger(directory=str(tmp_path), fmt="gpx")
         path = lg.start()
         lg.log_point(make_gps_data())
         lg.stop()
         (pt,) = _gpx_points(path)
+        tags = []
+        for child in pt:
+            ns, _, name = child.tag[1:].partition("}")
+            assert ns == GPX_NS["g"], child.tag
+            tags.append(name)
+        assert tags == ["ele", "time", "sat", "hdop", "vdop", "pdop", "extensions"]
+        assert tags == sorted(tags, key=WPT_SEQUENCE.index)
         assert pt.find("g:speed", GPX_NS) is None
+        assert pt.find("g:sat", GPX_NS).text == "3"
+        assert pt.find("g:vdop", GPX_NS).text == "1.4"
+        assert pt.find("g:pdop", GPX_NS).text == "1.7"
+        speed = pt.find("g:extensions/tpx:TrackPointExtension/tpx:speed", GPX_NS)
+        assert speed.text == "1.50"
+        float(pt.find("g:ele", GPX_NS).text)
+
+    def test_gpx_without_speed_has_no_extensions(self, tmp_path, make_gps_data):
+        lg = GPSLogger(directory=str(tmp_path), fmt="gpx")
+        path = lg.start()
+        lg.log_point(make_gps_data(speed=float("nan"), satellites_used=0))
+        lg.stop()
+        (pt,) = _gpx_points(path)
+        tags = [child.tag.split("}")[1] for child in pt]
+        assert "extensions" not in tags and "sat" not in tags
+
+
+def test_start_twice_in_same_second_does_not_overwrite(tmp_path, make_gps_data, monkeypatch):
+    """N7: a second log started in the same second gets its own file."""
+    from tuigps import gps_logger
+
+    class FrozenDatetime:
+        @staticmethod
+        def now():
+            from datetime import datetime
+            return datetime(2026, 3, 14, 12, 0, 0)
+
+    monkeypatch.setattr(gps_logger, "datetime", FrozenDatetime)
+    lg = GPSLogger(directory=str(tmp_path), fmt="gpx")
+    first = lg.start()
+    lg.log_point(make_gps_data())
+    lg.stop()
+    second = lg.start()
+    lg.stop()
+    third = lg.start()
+    lg.stop()
+    assert first.name == "tuigps_20260314_120000.gpx"
+    assert second.name == "tuigps_20260314_120000_1.gpx"
+    assert third.name == "tuigps_20260314_120000_2.gpx"
+    assert len(_gpx_points(first)) == 1  # first log was not overwritten
+
+
+def test_log_point_after_stop_from_other_thread_is_safe(tmp_path, make_gps_data):
+    """log_point (gpsd thread) and stop (UI thread) are serialized."""
+    import threading
+
+    lg = GPSLogger(directory=str(tmp_path), fmt="csv")
+    lg.start()
+    errors = []
+
+    def writer():
+        try:
+            for i in range(500):
+                lg.log_point(make_gps_data(time=f"t{i}"))
+        except Exception as exc:  # pragma: no cover - failure path
+            errors.append(exc)
+
+    t = threading.Thread(target=writer)
+    t.start()
+    lg.stop()
+    t.join()
+    assert errors == []
 
 
 class TestCSV:

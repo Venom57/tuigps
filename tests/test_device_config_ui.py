@@ -189,19 +189,21 @@ async def test_arm_clock_toggle():
 async def test_set_clock_now_uses_clock_sync(make_gps_data, monkeypatch):
     calls = []
 
-    def fake_set_clock(gps_time, last_seen):
-        calls.append((gps_time, last_seen))
+    def fake_set_clock(gps_time, fix_received):
+        calls.append((gps_time, fix_received))
         return "System clock set to: fake"
 
     monkeypatch.setattr(dc, "set_clock_from_gps", fake_set_clock)
+    # F2: fix age is measured from the TPV receipt, not the last message of any class
     data = make_gps_data()
+    data.tpv_received = data.last_seen - 0.8
     app = Harness()
     async with app.run_test(size=(140, 50)) as pilot:
         w = app.query_one(DeviceConfig)
         w.update_gps_data(data)
         await press(pilot, w, "btn-set-clock")
         assert await wait_for(pilot, lambda: "System clock set to: fake" in log_text(w))
-    assert calls == [(data.time, data.last_seen)]
+    assert calls == [(data.time, data.tpv_received)]
 
 
 async def test_run_ubxtool_runs_subprocess(monkeypatch):
@@ -298,8 +300,9 @@ def _pps_setup(monkeypatch, results):
         DeviceConfig, "_wait_for_pps",
         staticmethod(lambda path, timeout_sec=3: (PPS_BASE + 1, 2_000_000, 7)),
     )
-    # GPS time .250 received 0.7 s ago -> current GPS time ~ .950 -> target = +1 s
-    return calls, dict(time=PPS_GPS_TIME, last_seen=now - 0.7)
+    # GPS time .250 received 0.7 s ago -> current GPS time ~ .950 -> target = +1 s.
+    # last_seen (a later SKY/PPS message) must not be used as the reference (F2).
+    return calls, dict(time=PPS_GPS_TIME, tpv_received=now - 0.7, last_seen=now - 0.1)
 
 
 async def test_pps_sync_applies_relative_offset(make_gps_data, monkeypatch):
@@ -331,6 +334,16 @@ async def test_pps_sync_failure_reports_each_command(make_gps_data, monkeypatch)
     assert "busctl: busctl-err" in out
     assert "sudo: sudo-err" in out
     assert calls[-1] == ["sudo", "-n", "date", "-u", "-s", "2026-03-14 12:00:01"]
+
+
+async def test_pps_sync_requires_tpv_receipt_time(make_gps_data, monkeypatch):
+    monkeypatch.setattr(dc.glob, "glob", lambda pat: ["/dev/pps0"])
+    app = Harness()
+    async with app.run_test(size=(140, 50)) as pilot:
+        w = app.query_one(DeviceConfig)
+        w.update_gps_data(make_gps_data(tpv_received=0.0))
+        await press(pilot, w, "btn-pps-sync")
+        assert "no GPS time available for PPS sync" in log_text(w)
 
 
 async def test_pps_sync_unparseable_time(make_gps_data, monkeypatch):
