@@ -18,7 +18,7 @@ dev = [
 ]
 
 [project.scripts]
-tuigps = "tuigps.app:run"
+tuigps = "tuigps.cli:main"
 
 [build-system]
 requires = ["hatchling"]

@@ -57,9 +57,9 @@ class TuiGPS(App):
 
     ENABLE_COMMAND_PALETTE = False
 
-    def __init__(self):
+    def __init__(self, host: str | None = None, port: str | int | None = None):
         super().__init__()
-        self._gpsd = GPSDClient()
+        self._gpsd = GPSDClient(host=host, port=port)
         self._gps_data = GPSData()
         self._units = "metric"
         self._coord_format = "dd"
@@ -401,7 +401,8 @@ class TuiGPS(App):
         self._gpsd.stop()
 
 
-def run() -> None:
-    """Entry point for the tuigps command."""
-    app = TuiGPS()
-    app.run()
+def run(argv: list[str] | None = None) -> None:
+    """Run tuigps (kept for compatibility; see tuigps.cli.main)."""
+    from .cli import main
+
+    main(argv)

@@ -9,7 +9,8 @@ Terminal UI GPS monitoring tool using gpsd.
 
 ## Project Structure
 - `src/tuigps/` — main package
-  - `app.py` — Textual App entry point
+  - `app.py` — Textual App
+  - `cli.py` — command-line entry point (`tuigps`, `python -m tuigps`)
   - `app.tcss` — CSS layout
   - `gpsd_client.py` — threaded native gpsd client (TCP, `?WATCH`, JSON + raw NMEA)
   - `data_model.py` — dataclasses for GPS state
@@ -28,7 +29,7 @@ Terminal UI GPS monitoring tool using gpsd.
 
 ## Commands
 - `pip install -e .` — install in dev mode
-- `tuigps` — run the app
+- `tuigps [host[:port]] [--host H] [--port P]` — run the app (defaults: `$GPSD_HOST`/`$GPSD_PORT`, else 127.0.0.1:2947)
 - `python -m tuigps` — alternative run method
 
 ## Testing with simulated GPS
