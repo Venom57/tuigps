@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import sys
 import threading
@@ -37,16 +38,26 @@ except ImportError:
         except ValueError:
             pass
 
+log = logging.getLogger(__name__)
+
 
 class GPSDClient:
     """Connects to gpsd in a background thread and keeps GPSData updated."""
+
+    RECONNECT_DELAY = 2.0  # seconds between connection attempts
+    POLL_TIMEOUT = 0.5  # max wait per waiting() call; bounds stop() latency
+    STOP_TIMEOUT = 1.0  # max time stop() waits for the thread to exit
+    GPSD_TOFF_HOLD = 5.0  # prefer a gpsd TOFF message this recent over computed TOFF
 
     def __init__(self, host: str = "127.0.0.1", port: str = "2947"):
         self.host = host
         self.port = port
         self._session: _gps_module.gps | None = None
         self._thread: threading.Thread | None = None
-        self._running = False
+        # Each run gets its own stop event, so a stopped thread can never be
+        # revived by a later start() (see _running).
+        self._stop_event = threading.Event()
+        self._stop_event.set()
         self._data = GPSData()
         self._lock = threading.Lock()
         self._on_update: callable = None
@@ -54,6 +65,7 @@ class GPSDClient:
         self._on_nmea: callable = None
         self._toff_buffer: deque[float] = deque(maxlen=20)
         self._receipt_time: float = 0.0  # time.time() at message receipt
+        self._gpsd_toff_received: float = 0.0  # receipt time of last gpsd TOFF
         self.toff_armed = False  # armed: fire on next TPV with GPS time
 
     @property
@@ -61,52 +73,84 @@ class GPSDClient:
         with self._lock:
             return self._data
 
+    @property
+    def _running(self) -> bool:
+        """True while the current run has not been asked to stop."""
+        return not self._stop_event.is_set()
+
+    @_running.setter
+    def _running(self, value: bool) -> None:
+        if not value:
+            self._stop_event.set()
+        elif self._stop_event.is_set():
+            self._stop_event = threading.Event()
+
     def start(self, on_update: callable = None, on_error: callable = None, on_nmea: callable = None) -> None:
-        """Start the gpsd polling thread."""
+        """Start the gpsd polling thread (stopping any previous one first)."""
+        self.stop()
         self._on_update = on_update
         self._on_error = on_error
         self._on_nmea = on_nmea
-        self._running = True
-        self._thread = threading.Thread(target=self._run, daemon=True, name="gpsd-client")
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, args=(self._stop_event,), daemon=True, name="gpsd-client"
+        )
         self._thread.start()
 
-    def stop(self) -> None:
-        """Stop the polling thread."""
-        self._running = False
-        if self._session:
-            try:
-                self._session.close()
-            except Exception:
-                pass
-            self._session = None
+    def stop(self, timeout: float | None = None) -> None:
+        """Stop the polling thread and wait (bounded) for it to exit."""
+        self._stop_event.set()
+        session, self._session = self._session, None
+        self._close_session(session)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread() and thread.is_alive():
+            thread.join(self.STOP_TIMEOUT if timeout is None else timeout)
+            if thread.is_alive():
+                log.warning("gpsd client thread did not exit within the stop timeout")
 
-    def _run(self) -> None:
+    def reset(self) -> None:
+        """Discard all received data, e.g. before reconnecting."""
+        with self._lock:
+            self._data = GPSData()
+        self._toff_buffer.clear()
+        self._gpsd_toff_received = 0.0
+
+    def _run(self, stop: threading.Event | None = None) -> None:
         """Main polling loop — runs in background thread."""
-        while self._running:
+        if stop is None:
+            stop = self._stop_event
+        while not stop.is_set():
+            session = None
             try:
-                self._connect()
-                self._poll_loop()
+                session = self._connect()
+                self._poll_loop(session, stop)
             except Exception as exc:
+                if stop.is_set():
+                    break  # errors caused by stop() closing the session
                 with self._lock:
                     self._data.connected = False
                     self._data.error_message = str(exc)
-                if self._on_error:
-                    self._on_error(str(exc))
+                self._call(self._on_error, str(exc))
+            finally:
+                # Close session before retrying
+                if session is not None and self._session is session:
+                    self._session = None
+                self._close_session(session)
 
-            # Close session before retrying
-            if self._session:
-                try:
-                    self._session.close()
-                except Exception:
-                    pass
-                self._session = None
+            # Wait before reconnecting (returns at once when stopped)
+            stop.wait(self.RECONNECT_DELAY)
 
-            # Wait before reconnecting
-            if self._running:
-                time.sleep(2)
+    @staticmethod
+    def _close_session(session) -> None:
+        if session is None:
+            return
+        try:
+            session.close()
+        except OSError as exc:
+            log.debug("closing gpsd session failed: %s", exc)
 
-    def _connect(self) -> None:
-        """Establish connection to gpsd."""
+    def _connect(self):
+        """Establish connection to gpsd. Returns the new session."""
         watch_flags = (
             _gps_module.WATCH_ENABLE
             | _gps_module.WATCH_JSON
@@ -114,37 +158,50 @@ class GPSDClient:
             | _gps_module.WATCH_TIMING
             | _gps_module.WATCH_NMEA
         )
-        self._session = _gps_module.gps(
+        session = _gps_module.gps(
             host=self.host,
             port=self.port,
             mode=watch_flags,
         )
+        self._session = session
         with self._lock:
             self._data.connected = True
             self._data.error_message = ""
         self._notify_update()
+        return session
 
-    def _poll_loop(self) -> None:
+    def _poll_loop(self, session, stop: threading.Event) -> None:
         """Read reports until disconnected or stopped."""
-        while self._running:
-            if not self._session.waiting(timeout=2):
+        while not stop.is_set():
+            if not session.waiting(timeout=self.POLL_TIMEOUT):
                 continue
-            result = self._session.read()
+            result = session.read()
             self._receipt_time = time.time()  # capture ASAP for precise TOFF
             if result == -1:
                 raise ConnectionError("gpsd disconnected")
+            if stop.is_set():
+                break
 
             # Capture raw NMEA sentences before extracting structured data
-            response = getattr(self._session, "response", "")
-            if response and response.startswith("$") and self._on_nmea:
-                self._on_nmea(response.rstrip())
+            response = getattr(session, "response", "")
+            if response and response.startswith("$"):
+                self._call(self._on_nmea, response.rstrip())
 
-            self._extract_data()
+            self._extract_data(session)
             self._notify_update()
 
     def _notify_update(self) -> None:
-        if self._on_update:
-            self._on_update(self._data)
+        self._call(self._on_update, self._data)
+
+    @staticmethod
+    def _call(callback, *args) -> None:
+        """Invoke a user callback; its exceptions are not connection errors."""
+        if callback is None:
+            return
+        try:
+            callback(*args)
+        except Exception:
+            log.exception("gpsd client callback %r failed", callback)
 
     def _safe_float(self, value) -> float:
         """Convert a value to float, returning NaN for invalid values."""
@@ -154,9 +211,9 @@ class GPSDClient:
         except (TypeError, ValueError):
             return float("nan")
 
-    def _extract_data(self) -> None:
+    def _extract_data(self, session=None) -> None:
         """Extract data from the gps session into our data model."""
-        s = self._session
+        s = session if session is not None else self._session
         if s is None:
             return
 
@@ -247,12 +304,15 @@ class GPSDClient:
             sys_sec = int(sys_epoch)
             sys_nsec = (sys_epoch - sys_sec) * 1e9
 
-            d.toff = TOFFData(
-                real_sec=float(gps_sec),
-                real_nsec=gps_nsec,
-                clock_sec=float(sys_sec),
-                clock_nsec=sys_nsec,
-            )
+            # A real gpsd TOFF message (PPS-capable devices) takes precedence
+            gpsd_toff_age = sys_epoch - self._gpsd_toff_received
+            if not (self._gpsd_toff_received > 0 and gpsd_toff_age < self.GPSD_TOFF_HOLD):
+                d.toff = TOFFData(
+                    real_sec=float(gps_sec),
+                    real_nsec=gps_nsec,
+                    clock_sec=float(sys_sec),
+                    clock_nsec=sys_nsec,
+                )
 
             # Accumulate TOFF sample (offset in seconds)
             offset = gps_epoch - sys_epoch
@@ -317,6 +377,7 @@ class GPSDClient:
 
     def _extract_toff(self, s, d: GPSData) -> None:
         """Extract TOFF (Time Offset) data."""
+        self._gpsd_toff_received = self._receipt_time or time.time()
         raw = s.data if hasattr(s.data, "get") else {}
         d.toff = TOFFData(
             real_sec=self._safe_float(raw.get("real_sec", float("nan"))),

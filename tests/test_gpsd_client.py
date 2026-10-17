@@ -21,9 +21,10 @@ GPS_EPOCH = datetime(2026, 3, 14, 12, 0, 0, 250000, tzinfo=timezone.utc).timesta
 
 @pytest.fixture
 def fast_sleep(monkeypatch):
-    """Make gpsd_client's reconnect sleep short (patches only the module's ``time``)."""
+    """Make gpsd_client's reconnect delay short."""
     fake_time = types.SimpleNamespace(time=_real_time.time, sleep=lambda s: _real_time.sleep(0.02))
     monkeypatch.setattr(gpsd_client, "time", fake_time)
+    monkeypatch.setattr(GPSDClient, "RECONNECT_DELAY", 0.02)
     return fake_time
 
 
@@ -275,6 +276,25 @@ def test_toff_armed_single_shot(tpv_session):
     c._extract_data()
     assert d.toff_armed_offset == pytest.approx(0.005, abs=1e-6)
     assert len(d.toff_samples) == 2
+
+
+def test_gpsd_toff_message_takes_precedence(tpv_session, fake_session):
+    """N7: a recent gpsd TOFF message is not overwritten by the TPV-computed TOFF."""
+    c = _client_with(fake_session(data={"class": "TOFF", "real_sec": 10, "real_nsec": 20,
+                                        "clock_sec": 10, "clock_nsec": 30}))
+    c._receipt_time = GPS_EPOCH
+    c._extract_data()
+    c._session = tpv_session()
+    c._receipt_time = GPS_EPOCH + 4.9
+    c._extract_data()
+    assert c.data.toff.real_sec == 10.0 and c.data.toff.clock_nsec == 30.0
+    # TPV-derived samples are still accumulated
+    assert len(c.data.toff_samples) == 1
+
+    # Once the gpsd TOFF is older than GPSD_TOFF_HOLD the computed value is used
+    c._receipt_time = GPS_EPOCH + 5.1
+    c._extract_data()
+    assert c.data.toff.real_sec == float(int(GPS_EPOCH))
 
 
 def test_toff_armed_waits_for_tpv_with_time(fake_session):
@@ -570,11 +590,15 @@ def test_start_and_stop_thread(fake_gps, fast_sleep):
     c.stop()
 
 
-@pytest.mark.xfail(strict=True, reason="F3: exception in update callback is treated as a connection error")
-def test_update_callback_exception_does_not_drop_connection(fake_gps, fake_session, tpv_session):
+def test_update_callback_exception_does_not_drop_connection(
+    fake_gps, fake_session, tpv_session, caplog
+):
+    """F3: a failing callback is logged; the connection survives."""
     tpv = tpv_session()
-    session = fake_session(messages=[{"data": {"class": "TPV"}, "fix": vars(tpv.fix)},
-                                     {"data": {"class": "WATCH"}}])
+    session = fake_session(messages=[
+        {"data": {"class": "TPV"}, "fix": vars(tpv.fix), "response": "$GPGGA,1*00"},
+        {"data": {"class": "WATCH"}},
+    ])
     c, rec = _scripted_client(fake_gps, session)
 
     def on_update(data):
@@ -582,21 +606,130 @@ def test_update_callback_exception_does_not_drop_connection(fake_gps, fake_sessi
         if data.mode == 3:
             raise RuntimeError("widget exploded")
 
+    def on_nmea(sentence):
+        raise ValueError("nmea exploded")
+
     c._on_update = on_update
+    c._on_nmea = on_nmea
     c._run()
+    # Both messages were processed; only the real disconnect is an error
+    assert len(rec.updates) == 3
+    assert session.read_count == 3
     assert rec.errors == ["gpsd disconnected"]
+    logged = " ".join(r.getMessage() + str(r.exc_info) for r in caplog.records)
+    assert "widget exploded" in logged and "nmea exploded" in logged
 
 
-@pytest.mark.xfail(strict=True, reason="F4: stop() does not join, so restart leaves the old thread running")
+def test_error_callback_exception_is_contained(fake_gps, fast_sleep):
+    c = GPSDClient()
+    calls = []
+
+    def on_error(msg):
+        calls.append(msg)
+        c._running = False
+        raise RuntimeError("notify failed")
+
+    c._on_error = on_error
+    c._running = True
+    c._run()  # must not raise
+    assert len(calls) == 1
+
+
+def _client_threads():
+    return [t for t in threading.enumerate() if t.name == "gpsd-client" and t.is_alive()]
+
+
 def test_restart_does_not_leave_old_thread_running(fake_gps, fast_sleep):
+    """F4: stop() joins, and start() never leaves two polling threads."""
     c = GPSDClient()
     c.start()
     old = c._thread
     try:
         c.stop()
-        c.start()
         assert not old.is_alive()
+        c.start()
+        assert c._thread is not old
+        assert _client_threads() == [c._thread]
+        # start() while running stops the previous run first
+        second = c._thread
+        c.start()
+        assert not second.is_alive()
+        assert _client_threads() == [c._thread]
     finally:
-        c._running = False
-        old.join(2.0)
-        c._thread.join(2.0)
+        c.stop()
+    assert not c._thread.is_alive()
+    assert not c._running
+
+
+def test_stop_interrupts_reconnect_delay(fake_gps, monkeypatch):
+    monkeypatch.setattr(GPSDClient, "RECONNECT_DELAY", 30.0)
+    c = GPSDClient()
+    failed = threading.Event()
+    c.start(on_error=lambda msg: failed.set())
+    assert failed.wait(2.0)
+    t0 = _real_time.monotonic()
+    c.stop()
+    assert _real_time.monotonic() - t0 < 1.0
+    assert not c._thread.is_alive()
+
+
+def test_stop_interrupts_polling_session(fake_gps, fake_session):
+    """A connected thread blocked in waiting() exits promptly on stop()."""
+
+    class IdleSession(fake_session):
+        def waiting(self, timeout=0):
+            _real_time.sleep(min(timeout, 0.05))
+            return False
+
+    session = IdleSession()
+    fake_gps.gps.factory = lambda **kw: session
+    connected = threading.Event()
+    c = GPSDClient()
+    c.start(on_update=lambda d: connected.set())
+    assert connected.wait(2.0)
+    c.stop()
+    assert not c._thread.is_alive()
+    assert session.closed and c._session is None
+
+
+def test_stop_from_callback_thread_does_not_self_join(fake_gps, fast_sleep):
+    c = GPSDClient()
+    done = threading.Event()
+
+    def on_error(msg):
+        c.stop()  # runs on the client thread itself
+        done.set()
+
+    c.start(on_error=on_error)
+    assert done.wait(2.0)
+    c._thread.join(2.0)
+    assert not c._thread.is_alive()
+
+
+def test_stopped_run_errors_are_not_reported(fake_gps, fake_session):
+    """Errors caused by stop() closing the session are not reported."""
+    c = GPSDClient()
+    errors = []
+
+    class ClosingSession(fake_session):
+        def read(self):
+            c._running = False
+            raise OSError("socket closed")
+
+    fake_gps.gps.factory = lambda **kw: ClosingSession()
+    c._on_error = errors.append
+    c._running = True
+    c._run()
+    assert errors == []
+
+
+def test_reset_discards_data(tpv_session):
+    c = _client_with(tpv_session())
+    c._receipt_time = GPS_EPOCH
+    c._extract_data()
+    old = c.data
+    assert old.has_fix and c._toff_buffer
+    c.reset()
+    assert c.data is not old
+    assert not c.data.has_fix and not c._toff_buffer
+    assert c._gpsd_toff_received == 0.0

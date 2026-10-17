@@ -308,6 +308,7 @@ class TuiGPS(App):
             if new_host != self._gpsd.host or new_port != self._gpsd.port:
                 self._gpsd.stop()
                 self._gpsd = GPSDClient(host=new_host, port=new_port)
+                self._gps_data = self._gpsd.data
                 self._gpsd.start(
                     on_update=self._on_gpsd_update,
                     on_error=self._on_gpsd_error,
@@ -363,7 +364,9 @@ class TuiGPS(App):
     def action_reconnect(self) -> None:
         """Force reconnection to gpsd."""
         self._gpsd.stop()
-        self._gps_data = GPSData()
+        # Reset the client's data too, so the UI and the client agree
+        self._gpsd.reset()
+        self._gps_data = self._gpsd.data
         self._gpsd.start(
             on_update=self._on_gpsd_update,
             on_error=self._on_gpsd_error,

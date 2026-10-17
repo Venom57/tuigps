@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import math
+import threading
 
 import pytest
 from textual.widgets import Button, Input, RichLog, Select, TabbedContent
@@ -191,14 +192,24 @@ async def test_key_maps(make_gps_data, opened_urls):
     assert opened_urls == ["https://maps.google.com/?q=47.606200,-122.332100"]
 
 
-async def test_key_reconnect(fake_gps):
+async def test_key_reconnect(fake_gps, make_gps_data):
     app = TuiGPS()
     async with app.run_test(size=SIZE) as pilot:
+        old_thread = app._gpsd._thread
+        app._gpsd._data = make_gps_data()  # client has a fix from the old session
+        app._gps_data = app._gpsd.data
         old_data = app._gps_data
         await pilot.press("r")
         await pilot.pause()
         assert app._gps_data is not old_data
         assert app._gpsd._running
+        # F4: client data was reset too, so the UI and the client agree
+        assert app._gps_data is app._gpsd.data
+        assert not app._gps_data.has_fix
+        # ...and only the new polling thread is alive
+        assert not old_thread.is_alive()
+        alive = [t for t in threading.enumerate() if t.name == "gpsd-client" and t.is_alive()]
+        assert alive == [app._gpsd._thread]
 
 
 async def test_settings_open_escape_and_cancel():
