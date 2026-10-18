@@ -8,7 +8,7 @@ from rich.text import Text
 from textual.widgets import Static
 
 from ..data_model import GPSData
-from ..formatting import fmt
+from ..formatting import fmt, trim
 
 
 class DevicePanel(Static):
@@ -27,6 +27,8 @@ class DevicePanel(Static):
         self._data: GPSData | None = None
 
     def update_gps_data(self, data: GPSData) -> None:
+        if data is self._data:
+            return  # same immutable snapshot: nothing new to draw
         self._data = data
         self.refresh()
 
@@ -42,7 +44,7 @@ class DevicePanel(Static):
                 txt.append(f"  gpsd {self._data.version.release}", style="bright_black")
                 txt.append(f" (proto {self._data.version.proto_major}.{self._data.version.proto_minor})\n",
                            style="bright_black")
-            return txt
+            return trim(txt)
 
         dev = self._data.device
 
@@ -67,4 +69,4 @@ class DevicePanel(Static):
             txt.append("  gpsd:   ", style="bright_black")
             txt.append(f"{v.release}\n")
 
-        return txt
+        return trim(txt)

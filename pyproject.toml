@@ -10,8 +10,16 @@ dependencies = [
     "rich>=13.0.0",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "pytest-cov>=5",
+    "pytest-xdist>=3",
+]
+
 [project.scripts]
-tuigps = "tuigps.app:run"
+tuigps = "tuigps.cli:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -22,3 +30,25 @@ packages = ["src/tuigps"]
 
 [tool.hatch.build.targets.sdist]
 include = ["src/tuigps"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+# Run the tests in parallel (pytest-xdist): the Pilot tests are CPU-bound.
+# This needs pytest-xdist (pip install -e '.[dev]'); without it pytest fails
+# with "unrecognized arguments: -n". Use -n0 for a single serial process
+# (e.g. with pdb or to see print output).
+addopts = "-n auto"
+markers = [
+    "live_gpsd: run the real gpsd client thread in app tests",
+]
+
+[tool.coverage.run]
+source = ["tuigps"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.coverage.html]
+directory = "htmlcov"

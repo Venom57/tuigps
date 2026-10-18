@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass, field
 from enum import IntEnum
+
+from .constants import STALE_AFTER
 
 
 class FixMode(IntEnum):
@@ -105,10 +108,20 @@ class VersionInfo:
 class GPSData:
     """Complete GPS state — single source of truth for all widgets."""
 
-    # Connection state
+    # Connection state. ``connected`` mirrors connection_state == "connected".
     connected: bool = False
-    last_seen: float = 0.0
+    connection_state: str = "disconnected"  # "connecting" | "connected" | "disconnected"
+    last_seen: float = 0.0  # time.time() of the last message of any class
     error_message: str = ""
+    reconnect_attempts: int = 0  # consecutive failed connection attempts
+    retry_delay: float = 0.0  # current reconnect backoff (seconds)
+    next_retry_at: float = 0.0  # time.time() of the next connection attempt (0 = none)
+
+    # TPV epoch tracking: tpv_seq increments on every TPV message, so
+    # consumers can tell a new fix from a re-delivery of the same one;
+    # tpv_received is time.time() at receipt of that TPV (fix age reference).
+    tpv_seq: int = 0
+    tpv_received: float = 0.0
 
     # TPV data
     latitude: float = float("nan")
@@ -139,10 +152,14 @@ class GPSData:
     errors: ErrorEstimates = field(default_factory=ErrorEstimates)
     pps: PPSData = field(default_factory=PPSData)
     toff: TOFFData = field(default_factory=TOFFData)
+    # Where ``toff`` came from: "gpsd" (a gpsd TOFF report, PPS-capable
+    # devices) or "computed" (TPV time vs. system clock at receipt); "" = none
+    toff_source: str = ""
     device: DeviceInfo = field(default_factory=DeviceInfo)
     version: VersionInfo = field(default_factory=VersionInfo)
 
-    # TOFF history (last N offset samples in seconds, computed on gpsd thread)
+    # TOFF history (last N offset samples in seconds): always computed on the
+    # gpsd thread from TPV time vs. system clock, whatever ``toff_source`` is
     toff_samples: list[float] = field(default_factory=list)
 
     # Armed TOFF result: single-shot measurement (offset in seconds, or NaN)
@@ -178,3 +195,20 @@ class GPSData:
         sec_diff = self.pps.real_sec - self.pps.clock_sec
         nsec_diff = self.pps.real_nsec - self.pps.clock_nsec
         return (sec_diff * 1_000_000) + (nsec_diff / 1_000)
+
+
+def staleness(data: GPSData | None, now: float | None = None) -> str:
+    """Why ``data`` should not be shown as live: "" when it is current.
+
+    Returns "CONNECTING", "DISCONNECTED", or "STALE <n>s" when the last gpsd
+    message is older than ``STALE_AFTER`` seconds. Connected without any
+    message yet is not stale (there is no data to mistake for live data).
+    """
+    if data is None or data.connection_state == "connecting":
+        return "CONNECTING" if data is not None else "DISCONNECTED"
+    if not data.connected:
+        return "DISCONNECTED"
+    if data.last_seen <= 0:
+        return ""
+    age = (time.time() if now is None else now) - data.last_seen
+    return f"STALE {int(age)}s" if age > STALE_AFTER else ""

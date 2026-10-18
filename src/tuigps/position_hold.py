@@ -38,6 +38,7 @@ class PositionHold:
     def __init__(self):
         self._active = False
         self._count = 0
+        self._alt_count = 0  # fixes with a valid altitude (alt has its own n)
         self._start_time = 0.0
         # Welford accumulators for lat, lon, alt
         self._mean_lat = 0.0
@@ -59,6 +60,7 @@ class PositionHold:
         """Start a new hold session, clearing accumulators."""
         self._active = True
         self._count = 0
+        self._alt_count = 0
         self._start_time = time.time()
         self._mean_lat = 0.0
         self._mean_lon = 0.0
@@ -94,8 +96,9 @@ class PositionHold:
         self._m2_lon += delta_lon * delta2_lon
 
         if math.isfinite(alt):
+            self._alt_count += 1
             delta_alt = alt - self._mean_alt
-            self._mean_alt += delta_alt / n
+            self._mean_alt += delta_alt / self._alt_count
             delta2_alt = alt - self._mean_alt
             self._m2_alt += delta_alt * delta2_alt
 
@@ -108,12 +111,13 @@ class PositionHold:
             )
 
         duration = time.time() - self._start_time if self._active else 0.0
+        mean_alt = self._mean_alt if self._alt_count > 0 else float("nan")
 
         if self._count < 2:
             return HoldResult(
                 mean_lat=self._mean_lat,
                 mean_lon=self._mean_lon,
-                mean_alt=self._mean_alt,
+                mean_alt=mean_alt,
                 fix_count=self._count,
                 duration=duration,
             )
@@ -121,7 +125,9 @@ class PositionHold:
         # Variance in degrees
         var_lat = self._m2_lat / (self._count - 1)
         var_lon = self._m2_lon / (self._count - 1)
-        var_alt = self._m2_alt / (self._count - 1)
+        var_alt = (
+            self._m2_alt / (self._alt_count - 1) if self._alt_count > 1 else float("nan")
+        )
 
         # Convert to meters
         std_north = math.sqrt(var_lat) * M_PER_DEG_LAT
@@ -135,7 +141,7 @@ class PositionHold:
         return HoldResult(
             mean_lat=self._mean_lat,
             mean_lon=self._mean_lon,
-            mean_alt=self._mean_alt,
+            mean_alt=mean_alt,
             std_north=std_north,
             std_east=std_east,
             std_alt=std_alt,

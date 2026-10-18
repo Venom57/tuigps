@@ -22,58 +22,70 @@ TabPane {
     height: 1fr;
 }
 
+/* Responsive grid: the app sets one of -wide (3 columns, >= 120 cells),
+   -medium (2 columns, >= 80) or -narrow (1 column) on resize, and reorders
+   the panels for -medium (see TuiGPS._layout_dashboard). Text panels size
+   their rows to their content; the sky plot row takes the remaining height
+   (at least the min-height allows; otherwise the dashboard scrolls). */
 #dashboard-grid {
     layout: grid;
-    grid-size: 3 3;
+    grid-size: 3;
     grid-columns: 1fr 1fr 1fr;
-    grid-rows: 3fr 4fr 3fr;
+    grid-rows: auto 1fr auto;
     grid-gutter: 0 1;
-    min-height: 30;
-    height: auto;
+    height: 1fr;
+    min-height: 41;  /* rows 1 and 3 (~25) + a 14-line sky plot (16 with border) */
     padding: 0 1;
 }
 
-/* Row 1: info panels */
-PositionPanel {
-    column-span: 1;
+#dashboard-grid > * {
+    height: 100%;  /* fill the row: panels in a row line up */
     border: solid $accent;
 }
 
-FixPanel {
-    column-span: 1;
-    border: solid $accent;
-}
-
-VelocityPanel {
-    column-span: 1;
-    border: solid $accent;
-}
-
-/* Row 2: sky plot + signal chart */
-SkyPlot {
+#dashboard-grid > SkyPlot {
     column-span: 2;
     border: heavy $accent;
 }
 
-SignalChart {
-    column-span: 1;
-    border: solid $accent;
+#dashboard-grid.-medium {
+    grid-size: 2;
+    grid-columns: 1fr 1fr;
+    grid-rows: auto auto 1fr auto;
+    min-height: 51;  /* three text rows (~35) + a 14-line sky plot (16 with border) */
 }
 
-/* Row 3: bottom panels */
-ErrorPanel {
+#dashboard-grid.-medium > SkyPlot {
     column-span: 1;
-    border: solid $accent;
 }
 
-DevicePanel {
-    column-span: 1;
-    border: solid $accent;
+#dashboard-grid.-narrow {
+    grid-size: 1;
+    grid-columns: 1fr;
+    grid-rows: auto;
+    height: auto;
+    min-height: 0;
 }
 
-TimePanel {
+#dashboard-grid.-narrow > SkyPlot {
     column-span: 1;
-    border: solid $accent;
+    min-height: 18;
+    max-height: 18;
+}
+
+#dashboard-grid.-narrow > SignalChart {
+    min-height: 14;
+    max-height: 14;
+}
+
+
+/* ─── Stale or disconnected data (set by TuiGPS._update_staleness) ─── */
+
+.stale {
+    color: $text-muted;  /* text without its own color */
+    text-opacity: 50%;  /* colored text */
+    border-title-color: $warning;
+    border-title-style: bold;
 }
 
 
@@ -168,6 +180,12 @@ DeviceConfig {
     margin-right: 1;
 }
 
+#ntp-state {
+    height: 3;
+    content-align: left middle;
+    margin-left: 1;
+}
+
 .gnss-btn {
     min-width: 10;
 }
@@ -209,30 +227,54 @@ NMEAViewer {
 /* ─── Settings modal ─── */
 
 #settings-dialog {
-    width: 70;
-    max-width: 80;
+    width: 84;
+    max-width: 100%;
     height: auto;
-    max-height: 36;
+    max-height: 100%;
     border: heavy $accent;
     background: $surface;
-    padding: 1 2;
-}
-
-#settings-dialog Label {
-    margin: 1 0 0 0;
+    padding: 0 1;
 }
 
 #settings-dialog .settings-title {
     text-style: bold;
     width: 100%;
     content-align: center middle;
-    margin-bottom: 1;
+}
+
+#settings-body {
+    height: auto;
+    max-height: 80vh;
+}
+
+.settings-row {
+    height: auto;
+}
+
+.settings-field {
+    width: 1fr;
+    height: auto;
+    margin: 0 1 0 0;
+}
+
+.settings-field.settings-narrow {
+    width: 24;
+}
+
+#gnss-label {
+    width: 100%;
+    margin: 1 0 0 0;
+}
+
+.field-error {
+    width: 100%;
+    color: $error;
+    display: none;
 }
 
 #settings-buttons {
     layout: horizontal;
     height: auto;
-    margin-top: 1;
     align: center middle;
 }
 
@@ -241,12 +283,43 @@ NMEAViewer {
 }
 
 #gnss-checkboxes {
+    grid-size: 4;
+    grid-gutter: 0 1;
     height: auto;
-    margin: 0 0;
 }
 
 #gnss-checkboxes Checkbox {
-    width: auto;
-    margin: 0 1 0 0;
+    width: 100%;
     height: auto;
+}
+
+SettingsScreen {
+    align: center middle;
+}
+
+/* ─── Help modal ─── */
+
+HelpScreen {
+    align: center middle;
+}
+
+#help-dialog {
+    width: 90;
+    max-width: 100%;
+    height: auto;
+    max-height: 100%;
+    border: heavy $accent;
+    background: $surface;
+    padding: 0 1;
+    border-title-align: center;
+    border-title-style: bold;
+    border-subtitle-align: center;
+}
+
+#help-body {
+    height: auto;
+}
+
+#help-keys {
+    margin-bottom: 1;
 }

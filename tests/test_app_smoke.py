@@ -1,0 +1,1165 @@
+"""Headless Pilot smoke tests for the full TuiGPS app.
+
+In tests the client's default gpsd port refuses connections (see conftest),
+so the real GPSDClient thread starts, fails to connect and reports errors
+through the normal callback path. Data is then injected directly, or streamed
+by the fake gpsd server.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import math
+import threading
+import time
+
+import pytest
+from textual.widgets import Button, Input, RichLog, Select, TabbedContent
+
+from tuigps import app as app_module
+from tuigps.app import TuiGPS
+from tuigps.data_model import GPSData
+from tuigps.gpsd_client import GPSDClient
+from tuigps.screens.settings_screen import SettingsScreen
+from tuigps.widgets.connection_status import ConnectionStatus
+from tuigps.widgets.device_config import DeviceConfig
+from tuigps.widgets.nmea_viewer import NMEAViewer
+from tuigps.widgets.position_panel import PositionPanel
+
+SIZE = (130, 45)
+TABS = ["tab-dashboard", "tab-satellites", "tab-timing", "tab-device", "tab-nmea"]
+WIDGET_IDS = [
+    "w-position", "w-fix", "w-velocity", "w-skyplot", "w-signal", "w-errors", "w-device",
+    "w-time", "w-constellations", "w-sattable", "w-time-detail", "w-device-detail",
+    "w-connection",
+]
+
+
+@pytest.fixture(autouse=True)
+def _idle_gpsd_client(request, monkeypatch):
+    """Keep the app's gpsd thread idle so tests can inject data without races.
+
+    The real client publishes connection-state snapshots (which replace the
+    app's data) as soon as it starts; tests marked ``live_gpsd`` run it.
+    """
+    if request.node.get_closest_marker("live_gpsd"):
+        return
+    monkeypatch.setattr(GPSDClient, "_run", lambda self, stop=None: stop.wait())
+
+
+@pytest.fixture(autouse=True)
+def _no_browser(monkeypatch):
+    opened: list[str] = []
+    monkeypatch.setattr(app_module.webbrowser, "open", lambda url: opened.append(url))
+    return opened
+
+
+@pytest.fixture
+def opened_urls(_no_browser):
+    return _no_browser
+
+
+async def settle(pilot, app: TuiGPS, timeout: float = 2.0) -> None:
+    """Wait until updates posted from other threads have reached the widgets.
+
+    gpsd updates are delivered without blocking and coalesced into rate-limited
+    UI ticks, so they land a little after the producer call returns.
+    """
+    await pilot.pause()
+    for _ in range(int(timeout / 0.02)):
+        if not app._tick_pending:
+            break
+        await pilot.pause(0.02)
+    await pilot.pause()
+
+
+def render_all(app: TuiGPS) -> dict[str, str]:
+    return {wid: app.query_one(f"#{wid}").render().plain for wid in WIDGET_IDS}
+
+
+@pytest.mark.live_gpsd
+async def test_app_mounts_with_failing_gpsd():
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        assert app._gpsd._thread is not None and app._gpsd._thread.is_alive()
+        # The client thread attempted to connect and failed
+        for _ in range(100):
+            if app._gpsd.data.error_message:
+                break
+            await pilot.pause(0.02)
+        assert "Connection refused" in app._gpsd.data.error_message
+        assert not app._gpsd.data.connected
+        assert app.theme == "textual-dark"
+        await settle(pilot, app)
+        status = app.query_one("#w-connection", ConnectionStatus).render().plain
+        assert "DISCONNECTED \u2014 retry in" in status  # the failure reached the UI
+    # on_unmount stops the client
+    assert app._gpsd._running is False
+
+
+@pytest.mark.live_gpsd
+async def test_app_shows_data_from_fake_gpsd(fake_gpsd):
+    """End to end: fake gpsd -> native client -> dashboard widgets."""
+    from tests.test_gpsd_client import DEVICES_325, SKY_325, TPV_325
+
+    fake_gpsd.add(DEVICES_325, TPV_325, SKY_325)
+    app = TuiGPS()
+    app._gpsd = GPSDClient("127.0.0.1", fake_gpsd.port)
+    async with app.run_test(size=SIZE) as pilot:
+        for _ in range(150):
+            if app._gps_data.satellites and app._gps_data.has_fix:
+                break
+            await pilot.pause(0.02)
+        await pilot.pause(0.05)
+        assert fake_gpsd.received.startswith(b"?WATCH=")
+        assert "47.606200" in app.query_one("#w-position").render().plain
+        status = app.query_one("#w-connection", ConnectionStatus).render().plain
+        assert "3D Fix" in status and "DGPS" in status
+        assert "/dev/ttyACM0" in status
+
+
+@pytest.mark.live_gpsd
+async def test_outage_notifies_once_and_reconnect_is_announced(fake_gpsd, monkeypatch):
+    """U2: one error notification per outage, and a notice on reconnect."""
+    from tests.fake_gpsd import FakeGpsd
+    from tests.test_gpsd_client import TPV_325
+
+    monkeypatch.setattr(GPSDClient, "RECONNECT_DELAY", 0.02)
+    monkeypatch.setattr(GPSDClient, "RECONNECT_MAX", 0.05)
+    port = fake_gpsd.port
+    fake_gpsd.add(TPV_325)
+    app = TuiGPS()
+    app._gpsd = GPSDClient("127.0.0.1", port)
+    notes: list[str] = []
+    app.notify = lambda message, **kw: notes.append(message)
+
+    async def wait_for(predicate):
+        for _ in range(200):
+            if predicate():
+                return True
+            await pilot.pause(0.02)
+        return False
+
+    server = None
+    async with app.run_test(size=SIZE) as pilot:
+        assert await wait_for(lambda: app._gps_data.has_fix)
+        assert await wait_for(lambda: notes)
+        assert notes == [f"Connected to gpsd 127.0.0.1:{port}"]
+        fake_gpsd.close()
+        assert await wait_for(lambda: app._gps_data.reconnect_attempts >= 3)
+        await pilot.pause(0.05)
+        assert notes[1:] == ["gpsd: gpsd disconnected"]  # once, not per attempt
+        app._refresh_ui()
+        status = app.query_one("#w-connection", ConnectionStatus).render().plain
+        assert "DISCONNECTED" in status or "CONNECTING" in status
+        server = FakeGpsd(port=port)
+        try:
+            assert await wait_for(lambda: len(notes) == 3)
+            assert notes[2] == f"Connected to gpsd 127.0.0.1:{port}"
+        finally:
+            app._gpsd.stop()
+            server.close()
+
+
+async def test_every_tab_activates_and_renders(make_gps_data):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        tabs = app.query_one(TabbedContent)
+        for tab in TABS:
+            tabs.active = tab
+            await pilot.pause()
+            assert tabs.active == tab
+        rendered = render_all(app)
+        assert "47.606200" in rendered["w-position"]
+        assert "3D Fix" in rendered["w-fix"]
+        assert "Total:" in rendered["w-constellations"]
+        assert "PPS" in rendered["w-time-detail"]
+        assert "/dev/ttyACM0" in rendered["w-device-detail"]
+        assert "2GP+1GA" in rendered["w-connection"]
+        assert app.query_one("#w-device-config", DeviceConfig)._device_path == "/dev/ttyACM0"
+
+
+async def test_refresh_ui_with_empty_and_partial_data():
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app._gps_data = GPSData()
+        app._refresh_ui()
+        await pilot.pause()
+        rendered = render_all(app)
+        assert "Lat:  ---" in rendered["w-position"] and "Unknown" in rendered["w-fix"]
+        assert "DISCONNECTED" in rendered["w-connection"]
+        app._gps_data = GPSData(connected=True, last_seen=time.time(), mode=1,
+                                time="2026-03-14T12:00:00Z")
+        app._refresh_ui()
+        await pilot.pause()
+        rendered = render_all(app)
+        assert "No Fix" in rendered["w-fix"] and "12:00:00 UTC" in rendered["w-time"]
+        assert "No Fix" in rendered["w-connection"]
+
+
+async def test_gpsd_update_from_thread(make_gps_data):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        data = make_gps_data()
+        await asyncio.to_thread(app._on_gpsd_update, data)
+        await settle(pilot, app)
+        assert app._gps_data is data
+        assert "47.606200" in app.query_one("#w-position").render().plain
+
+
+async def test_nmea_and_error_from_thread(monkeypatch):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        notes = []
+        monkeypatch.setattr(app, "notify", lambda msg, **kw: notes.append((msg, kw)))
+        await asyncio.to_thread(app._on_nmea, "$GPGGA,123*00")
+        await asyncio.to_thread(app._on_gpsd_error, "boom")
+        await settle(pilot, app)
+        app.query_one(TabbedContent).active = "tab-nmea"
+        await pilot.pause()
+        log = app.query_one(NMEAViewer).query_one("#nmea-log", RichLog)
+        assert ["".join(seg.text for seg in line) for line in log.lines] == ["$GPGGA,123*00"]
+        assert notes == [("gpsd: boom", {"severity": "error", "timeout": 5})]
+
+
+async def test_keys_units_theme_dark():
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        assert app._units == "metric"
+        await pilot.press("u")
+        assert app._units == "imperial"
+        assert app.query_one("#w-position", PositionPanel).units == "imperial"
+        await pilot.press("u", "u")
+        assert app._units == "metric"
+
+        start = app.theme
+        await pilot.press("t")
+        assert app.theme != start
+        assert app.theme == app._theme_list[app._theme_index]
+        before = app.theme
+        await pilot.press("d")
+        assert app.theme == ("textual-dark" if before == "textual-light" else "textual-light")
+
+
+async def test_key_hold(make_gps_data):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("h")
+        assert app._hold.is_active
+        data = make_gps_data()
+        await asyncio.to_thread(app._on_gpsd_update, data)
+        await settle(pilot, app)
+        assert app._hold.fix_count >= 1
+        assert "Hold (" in app.query_one("#w-position").render().plain
+        assert "HOLD" in app.query_one("#w-connection").render().plain
+        await pilot.press("h")
+        assert not app._hold.is_active
+
+
+async def test_key_log_writes_into_cwd(tmp_path, monkeypatch, make_gps_data):
+    monkeypatch.chdir(tmp_path)
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("l")
+        assert app._gps_logger.is_active
+        path = app._gps_logger.filepath
+        await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
+        await settle(pilot, app)
+        assert app._gps_logger.fix_count == 1
+        assert "REC" in app.query_one("#w-connection").render().plain
+        await pilot.press("l")
+        assert not app._gps_logger.is_active
+    files = list(tmp_path.glob("tuigps_*.gpx"))
+    assert len(files) == 1 and files[0].name == path.name
+    text = files[0].read_text()
+    assert "<trkpt" in text and text.rstrip().endswith("</gpx>")
+
+
+async def test_unmount_stops_active_logger(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("l")
+    assert not app._gps_logger.is_active
+    (f,) = tmp_path.glob("tuigps_*.gpx")
+    assert f.read_text().rstrip().endswith("</gpx>")
+
+
+async def test_key_maps(make_gps_data, opened_urls):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("m")  # no fix -> warning, no browser
+        assert opened_urls == []
+        app._gps_data = make_gps_data()
+        await pilot.press("m")
+    assert opened_urls == ["https://maps.google.com/?q=47.606200,-122.332100"]
+
+
+async def test_key_reconnect(make_gps_data):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        old_thread = app._gpsd._thread
+        app._gpsd._data = make_gps_data(tpv_seq=5)  # client has a fix from the old session
+        app._on_gpsd_update(app._gpsd.data)
+        assert app._last_tpv_seq == 5
+        old_data = app._gps_data
+        await pilot.press("r")
+        await pilot.pause()
+        assert app._gps_data is not old_data
+        assert app._gpsd._running
+        # F4: client data was reset too, so the UI and the client agree
+        assert app._gps_data.tpv_seq == 0 == app._gpsd.data.tpv_seq
+        assert not app._gps_data.has_fix and not app._gpsd.data.has_fix
+        assert app._last_tpv_seq == 0  # the new session's first TPV (seq 1) is new
+        # ...and only the new polling thread is alive
+        assert not old_thread.is_alive()
+        alive = [t for t in threading.enumerate() if t.name == "gpsd-client" and t.is_alive()]
+        assert alive == [app._gpsd._thread]
+
+
+async def test_settings_open_escape_and_cancel():
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("s")
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+        assert app.screen.query_one("#input-host", Input).value == "127.0.0.1"
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+
+        await pilot.press("s")
+        await pilot.pause()
+        app.screen.query_one("#select-units", Select).value = "imperial"
+        app.screen.query_one("#btn-cancel", Button).press()
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+        assert app._units == "metric"
+
+
+async def test_settings_apply_same_host_keeps_client():
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        client = app._gpsd
+        await pilot.press("s")
+        await pilot.pause()
+        screen = app.screen
+        screen.query_one("#select-units", Select).value = "nautical"
+        screen.query_one("#select-coord", Select).value = "ddm"
+        screen.query_one("#chk-gnss-galileo").value = False
+        screen.query_one("#btn-apply", Button).press()
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+        assert app._units == "nautical"
+        assert app._coord_format == "ddm"
+        assert "galileo" not in app._config.display_gnss and "gps" in app._config.display_gnss
+        assert app._gpsd is client
+
+
+@pytest.mark.live_gpsd
+async def test_settings_apply_new_host_reconnects(monkeypatch):
+    attempts = []
+
+    def fake_open(self, stop):
+        attempts.append((self.host, self.port))
+        raise ConnectionRefusedError(111, "Connection refused")
+
+    monkeypatch.setattr(GPSDClient, "_open_socket", fake_open)
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        old = app._gpsd
+        await pilot.press("s")
+        await pilot.pause()
+        app.screen.query_one("#input-host", Input).value = "10.0.0.5"
+        app.screen.query_one("#input-port", Input).value = "3000"
+        app.screen.query_one("#btn-apply", Button).press()
+        await pilot.pause()
+        assert app._gpsd is not old
+        assert (app._gpsd.host, app._gpsd.port) == ("10.0.0.5", "3000")
+        assert old._running is False
+        for _ in range(50):
+            if ("10.0.0.5", "3000") in attempts:
+                break
+            await pilot.pause(0.02)
+        assert ("10.0.0.5", "3000") in attempts
+
+
+async def test_arm_and_clear_toff(make_gps_data):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app.query_one(TabbedContent).active = "tab-timing"
+        await pilot.pause()
+        btn = app.query_one("#btn-arm-toff", Button)
+        btn.press()
+        await pilot.pause()
+        assert app._gpsd.toff_armed
+        assert btn.variant == "success"
+
+        # Simulate the client firing the armed measurement
+        data = make_gps_data(toff_armed_offset=0.0123)
+        app._gpsd.toff_armed = False
+        app._gps_data = data
+        app._refresh_ui()
+        await pilot.pause()
+        assert btn.variant == "warning"
+        assert "+12.3 ms" in str(btn.label)
+        # Later refreshes keep showing the single-shot result
+        app._gps_data = make_gps_data(toff_armed_offset=0.05)
+        app._refresh_ui()
+        assert "+12.3 ms" in str(btn.label)
+
+        app.query_one("#btn-clear-toff", Button).press()
+        await pilot.pause()
+        assert str(btn.label) == "Arm TOFF"
+        assert app._gps_data.toff_samples == []
+        assert math.isnan(app._gps_data.toff_armed_offset)
+
+
+async def test_armed_clock_sync_fires_on_update(make_gps_data, monkeypatch):
+    calls = []
+
+    def fake_set_clock(gps_time, fix_received):
+        calls.append((gps_time, fix_received))
+        return "System clock set to: fake"
+
+    monkeypatch.setattr(app_module, "set_clock_from_gps", fake_set_clock)
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app.query_one(TabbedContent).active = "tab-device"
+        await pilot.pause()
+        app.query_one("#btn-arm-clock", Button).press()
+        await pilot.pause()
+        app.screen.query_one("#confirm-yes", Button).press()  # arming asks first
+        await pilot.pause()
+        assert app._armed_clock_set
+        # A non-TPV message does not fire the armed sync (F1)...
+        await asyncio.to_thread(app._on_gpsd_update, make_gps_data(tpv_seq=0))
+        assert app._armed_clock_set
+        # ...the next TPV does, with the TPV receipt time as fix age reference (F2)
+        data = make_gps_data(tpv_seq=1)
+        data.tpv_received = data.last_seen - 0.5
+        await asyncio.to_thread(app._on_gpsd_update, data)
+        await settle(pilot, app)
+        assert not app._armed_clock_set
+        btn = app.query_one("#btn-arm-clock", Button)
+        assert str(btn.label) == "Arm Clock Sync"
+    assert calls == [(data.time, data.tpv_received)]
+
+
+async def test_armed_clock_sync_error_is_reported(make_gps_data, monkeypatch):
+    def fake_set_clock(gps_time, fix_received):
+        raise ValueError("bad time")
+
+    monkeypatch.setattr(app_module, "set_clock_from_gps", fake_set_clock)
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app.query_one(TabbedContent).active = "tab-device"
+        await pilot.pause()
+        app._armed_clock_set = True
+        await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
+        await settle(pilot, app)
+        out = app.query_one(DeviceConfig).query_one("#config-output", RichLog)
+        text = "\n".join("".join(seg.text for seg in strip) for strip in out.lines)
+        assert "Clock sync error: bad time" in text
+
+
+async def test_deliver_clock_error_result(monkeypatch):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        notes = []
+        monkeypatch.setattr(app, "notify", lambda msg, **kw: notes.append((msg, kw)))
+        app.query_one(TabbedContent).active = "tab-device"  # RichLog writes need a size
+        await pilot.pause()
+        config = app.query_one(DeviceConfig)
+        btn = config.query_one("#btn-arm-clock", Button)
+        btn.label = "ARMED (click to cancel)"
+        app._deliver_clock_result("Error: could not set time.\n  details")
+        await pilot.pause()
+        out = config.query_one("#config-output", RichLog)
+        text = "\n".join("".join(seg.text for seg in strip) for strip in out.lines)
+        assert "Error: could not set time." in text and "details" in text
+        assert str(btn.label) == "Arm Clock Sync"
+        assert notes == [("Error: could not set time.", {"severity": "error", "timeout": 4})]
+
+
+# ─── App logic without a running event loop ───────────────────────────
+
+
+def test_update_without_running_app_is_safe(make_gps_data):
+    app = TuiGPS()
+    data = make_gps_data()
+    app._on_gpsd_update(data)
+    app._on_nmea("$GPGGA")
+    app._on_gpsd_error("x")
+    assert app._gps_data is data
+    assert not app._tick_pending  # nothing scheduled on a loop that does not exist
+
+
+def test_hold_counts_each_fix_once(make_gps_data):
+    """F1: SKY/PPS/NMEA updates re-deliver the same TPV and are not new fixes."""
+    app = TuiGPS()
+    app._hold.start()
+    data = make_gps_data()
+    for _ in range(3):  # e.g. TPV followed by SKY and PPS with the same fix
+        app._on_gpsd_update(data)
+    assert app._hold.fix_count == 1
+    data.tpv_seq += 1  # next TPV epoch
+    app._on_gpsd_update(data)
+    assert app._hold.fix_count == 2
+
+
+def test_hold_and_log_follow_client_tpv_epochs(tmp_path):
+    """End to end through GPSDClient: one hold/log entry per TPV message."""
+    from tests.test_gpsd_client import GGA, PPS_325, SKY_325, WATCH_325, tpv
+
+    app = TuiGPS()
+    app._hold.start()
+    app._gps_logger._directory = tmp_path
+    app._gps_logger._format = "csv"
+    app._gps_logger.start()
+    client = GPSDClient()
+    client._on_update = app._on_gpsd_update
+    for t in ["2026-03-14T12:00:00Z", "2026-03-14T12:00:01Z"]:
+        client._handle_line(tpv(time=t))
+        for line in (SKY_325, PPS_325, WATCH_325, GGA):  # same fix, other messages
+            client._handle_line(line)
+    app._gps_logger.stop()
+    assert client.data.tpv_seq == 2
+    assert app._hold.fix_count == 2
+    assert app._gps_logger.fix_count == 2
+
+
+async def test_failing_widget_update_is_logged_not_fatal(make_gps_data, monkeypatch, caplog):
+    """F15: one broken widget is logged and does not stop the other updates."""
+    from tuigps.widgets.fix_panel import FixPanel
+
+    def boom(self, data):
+        raise RuntimeError("fix panel exploded")
+
+    monkeypatch.setattr(FixPanel, "update_gps_data", boom)
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        await pilot.pause()
+        assert app.is_running
+        # Widgets after the failing one (on the active tab) were still updated
+        assert "/dev/ttyACM0" in app.query_one("#w-device").render().plain
+    assert any("#w-fix" in r.getMessage() and r.exc_info for r in caplog.records)
+
+
+async def test_refresh_with_modal_open_is_silent(make_gps_data, caplog):
+    """Widgets are not queryable while a modal is active: NoMatches is expected, not logged."""
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("s")
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        app._deliver_nmea_batch(["$GPGGA,1*00"])
+        app._deliver_clock_result("System clock set to: x")
+        await pilot.pause()
+        assert app.is_running
+    assert not [r for r in caplog.records if r.name.startswith("tuigps")]
+
+
+# ─── Non-blocking, coalesced delivery (P1/P2) ─────────────────────────
+
+
+async def test_gpsd_thread_never_waits_for_the_ui(make_gps_data, monkeypatch):
+    """P2: a slow UI refresh must not block the gpsd reader thread."""
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        refreshes = []
+        original = app._refresh_ui
+
+        def slow_refresh(*args, **kwargs):
+            refreshes.append(app._gps_data)
+            time.sleep(0.2)  # a pathologically slow UI
+            original(*args, **kwargs)
+
+        monkeypatch.setattr(app, "_refresh_ui", slow_refresh)
+        snapshots = [make_gps_data(tpv_seq=i, latitude=10.0 + i) for i in range(1, 51)]
+
+        def produce():
+            start = time.perf_counter()
+            for d in snapshots:
+                app._on_gpsd_update(d)
+                app._on_nmea("$GPGGA,x*00")
+            return time.perf_counter() - start
+
+        elapsed = await asyncio.to_thread(produce)
+        # 50 updates + 50 sentences; waiting on even three 0.2 s refreshes takes 0.6 s
+        assert elapsed < 0.5
+        await settle(pilot, app, timeout=3.0)
+        # Coalesced: at most one refresh per interval (plus the leading and trailing
+        # edges), and the last one shows the final state
+        assert 1 <= len(refreshes) <= 2 + elapsed / app_module.UI_MIN_INTERVAL
+        assert refreshes[-1] is snapshots[-1]
+        assert "60.000000" in app.query_one("#w-position").render().plain
+
+
+async def test_rapid_updates_are_coalesced_with_trailing_refresh(make_gps_data, monkeypatch):
+    """P1: updates within one refresh interval produce one more refresh, with the last data."""
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        shown = []
+        original = app._refresh_ui
+
+        def counting(*args, heartbeat=False, **kwargs):
+            if not heartbeat:  # heartbeats are timer-driven, not data deliveries
+                shown.append(app._gps_data)
+            original(*args, heartbeat=heartbeat, **kwargs)
+
+        monkeypatch.setattr(app, "_refresh_ui", counting)
+        # A wide interval, so the second and third updates land inside it even
+        # on a loaded machine (the default is 0.1 s)
+        monkeypatch.setattr(app_module, "UI_MIN_INTERVAL", 0.5)
+        first, second, third = (make_gps_data(tpv_seq=i) for i in (1, 2, 3))
+        await asyncio.to_thread(app._on_gpsd_update, first)  # leading edge: immediate
+        await pilot.pause()
+
+        def burst():  # within the interval: coalesced into the trailing edge
+            app._on_gpsd_update(second)
+            app._on_gpsd_update(third)
+
+        await asyncio.to_thread(burst)
+        await settle(pilot, app)
+        assert shown[0] is first
+        assert shown[-1] is third
+        assert len(shown) <= 2  # first, then one coalesced trailing refresh
+
+
+async def test_delivery_errors_during_shutdown_are_swallowed(make_gps_data, caplog):
+    """A closed event loop (app shutting down) must not raise on the gpsd thread."""
+
+    class ClosedLoop:
+        def call_soon_threadsafe(self, *args):
+            raise RuntimeError("Event loop is closed")
+
+    caplog.set_level("DEBUG", logger="tuigps.app")
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        loop = app._loop
+        app._loop = ClosedLoop()
+        try:
+            app._conn_state = ""
+            await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
+            await asyncio.to_thread(app._on_nmea, "$GPGGA,1*00")
+            await asyncio.to_thread(app._on_gpsd_error, "boom")
+            assert not app._tick_pending  # a later update can schedule again
+            assert "UI delivery dropped: event loop closed" in caplog.text
+        finally:
+            app._loop = loop
+
+
+async def test_producer_running_across_shutdown_is_safe(make_gps_data):
+    errors: list[BaseException] = []
+    stop = threading.Event()
+    app = TuiGPS()
+
+    def produce():
+        data = make_gps_data()
+        try:
+            while not stop.is_set():
+                app._on_gpsd_update(data)
+                app._on_nmea("$GPGGA,1*00")
+                time.sleep(0.001)
+        except BaseException as e:  # pragma: no cover - asserted below
+            errors.append(e)
+
+    thread = threading.Thread(target=produce)
+    async with app.run_test(size=SIZE) as pilot:
+        thread.start()
+        await pilot.pause(0.15)
+    await asyncio.sleep(0.1)  # keep producing after the app has stopped
+    stop.set()
+    thread.join(2)
+    assert errors == []
+    assert app._tick_handle is None
+
+
+# ─── Active-tab refresh, redundant renders, NMEA batches (P3/P5) ──────
+
+
+async def test_only_the_active_tab_is_refreshed(make_gps_data):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        data = make_gps_data()
+        app._gps_data = data
+        app._refresh_ui()
+        q = app.query_one
+        assert q("#w-position")._data is data and q("#w-skyplot")._data is data
+        assert q("#w-connection")._data is data
+        assert q("#w-device-config")._data is data  # always fed: clock set needs GPS time
+        assert q("#w-sattable")._data is not data  # hidden tabs are not refreshed...
+        assert q("#w-time-detail")._data is not data
+        app.query_one(TabbedContent).active = "tab-satellites"
+        await pilot.pause()
+        # ...until they are shown
+        assert q("#w-sattable")._data is data and q("#w-constellations")._data is data
+        assert "Total:" in q("#w-constellations").render().plain
+        app.query_one(TabbedContent).active = "tab-timing"
+        await pilot.pause()
+        assert q("#w-time-detail")._data is data and q("#w-device-detail")._data is data
+
+
+async def test_identical_snapshot_does_not_repaint(make_gps_data, monkeypatch):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        sky, bar = app.query_one("#w-skyplot"), app.query_one("#w-connection")
+        repaints = {"sky": 0, "bar": 0}
+        monkeypatch.setattr(sky, "refresh", lambda *a, **k: repaints.__setitem__("sky", repaints["sky"] + 1))
+        monkeypatch.setattr(bar, "refresh", lambda *a, **k: repaints.__setitem__("bar", repaints["bar"] + 1))
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        assert repaints == {"sky": 1, "bar": 1}
+        app._refresh_ui()  # same snapshot, same settings: nothing to repaint
+        assert repaints == {"sky": 1, "bar": 1}
+        app._heartbeat()  # the status bar is time-dependent (staleness)
+        assert repaints == {"sky": 1, "bar": 2}
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        assert repaints == {"sky": 2, "bar": 3}
+
+
+async def test_units_change_repaints_without_new_data(make_gps_data, monkeypatch):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        pos = app.query_one("#w-position", PositionPanel)
+        repaints = []
+        monkeypatch.setattr(pos, "refresh", lambda *a, **k: repaints.append(1))
+        app._refresh_ui()
+        assert repaints == []
+        await pilot.press("u")  # same snapshot, new display setting
+        assert repaints
+        assert "ft" in pos.render().plain
+
+
+async def test_nmea_is_delivered_in_batches(monkeypatch):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await settle(pilot, app)
+        viewer = app.query_one(NMEAViewer)
+        batches = []
+        original = viewer.append_nmea_batch
+
+        def record(sentences):
+            batches.append(len(sentences))
+            original(sentences)
+
+        monkeypatch.setattr(viewer, "append_nmea_batch", record)
+        sentences = [f"$GP{t},{i}*00" for i in range(100) for t in ("GGA", "RMC", "GSV")]
+
+        def produce():
+            start = time.perf_counter()
+            for s in sentences:
+                app._on_nmea(s)
+            return time.perf_counter() - start
+
+        elapsed = await asyncio.to_thread(produce)
+        await settle(pilot, app)
+        assert sum(batches) == 300
+        # One batch per UI tick: at most one per interval, plus the leading/trailing edges
+        assert len(batches) <= 2 + elapsed / app_module.UI_MIN_INTERVAL
+        assert viewer._total == 300 and viewer._type_counts["GSV"] == 100
+        assert list(viewer._buffer)[-1] == sentences[-1]
+        app.query_one(TabbedContent).active = "tab-nmea"
+        await pilot.pause()
+        log = viewer.query_one("#nmea-log", RichLog)
+        assert len(log.lines) == 300
+        assert viewer.query_one("#nmea-stats").render().plain.startswith("300 sentences")
+
+
+async def test_failing_ui_callback_is_logged(caplog):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        def boom():
+            raise RuntimeError("callback exploded")
+
+        app._run_ui_callback(boom, ())
+        await pilot.pause()
+        assert app.is_running
+    assert any("UI callback failed" in r.getMessage() and r.exc_info for r in caplog.records)
+    # After shutdown, scheduled callbacks are dropped without running
+    ran = []
+    app._run_ui_callback(lambda: ran.append(1), ())
+    assert ran == []
+
+
+def test_refresh_before_mount_is_a_no_op(make_gps_data):
+    app = TuiGPS()
+    app._gps_data = make_gps_data()
+    app._refresh_ui()
+    app._deliver_nmea_batch(["$GPGGA,1*00"])
+    assert app._stale_tag == ""  # the refresh returned before touching any widget
+
+
+# ─── Persistent configuration (U1) ────────────────────────────────────
+
+
+from tuigps import config as config_mod  # noqa: E402
+from tuigps.config import Config  # noqa: E402
+
+
+async def test_app_starts_with_saved_settings(config_file, make_gps_data):
+    config_mod.save(Config(units="imperial", coord_format="dms", theme="nord"))
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        assert app.theme == "nord"
+        assert app._theme_list[app._theme_index] == "nord"
+        assert (app._units, app._coord_format) == ("imperial", "dms")
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        plain = app.query_one("#w-position").render().plain
+        assert "164.9 ft" in plain and "47°36'22.32\"N" in plain
+
+
+async def test_config_warnings_are_notified(config_file):
+    config_file.parent.mkdir(parents=True)
+    config_file.write_text('{"units": "furlongs", "theme": "no-such-theme"}')
+    notes = []
+    app = TuiGPS()
+    app.notify = lambda message, **kw: notes.append((message, kw.get("severity")))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.pause()
+        assert app.theme == "textual-dark" and app._units == "metric"
+    assert [sev for _, sev in notes] == ["warning", "warning"]
+    assert "furlongs" in notes[0][0] and "no-such-theme" in notes[1][0]
+
+
+async def test_theme_and_units_keys_are_saved(config_file):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("u")
+        assert config_mod.load().units == "imperial"
+        await pilot.press("t")
+        assert config_mod.load().theme == app.theme != "textual-dark"
+        app._set_theme("nord")
+        await pilot.press("d")
+        assert app.theme == "textual-light"
+        assert config_mod.load().theme == "textual-light"
+        await pilot.press("d")
+        assert config_mod.load().theme == "textual-dark"
+        assert app._theme_list[app._theme_index] == "textual-dark"
+    saved = json.loads(config_file.read_text())
+    assert saved["host"] is None and saved["port"] is None
+
+
+async def test_explicit_config_path_is_used(tmp_path, config_file):
+    path = tmp_path / "mine.json"
+    config_mod.save(Config(units="nautical"), path)
+    app = TuiGPS(config_path=path)
+    async with app.run_test(size=SIZE) as pilot:
+        assert app._units == "nautical"
+        await pilot.press("u")
+    assert config_mod.load(path).units == "metric"
+    assert not config_file.exists()
+
+
+async def test_config_save_error_is_notified_not_fatal(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    notes = []
+    app = TuiGPS(config_path=blocker / "config.json")
+    app.notify = lambda message, **kw: notes.append((message, kw.get("severity")))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("u")
+        assert app.is_running and app._units == "imperial"
+    assert any(sev == "error" and "Cannot save settings" in m for m, sev in notes)
+
+
+async def test_cli_server_override_is_not_saved(config_file):
+    config_mod.save(Config(host="cfghost", port=3001))
+    app = TuiGPS(host="clihost", port="4000")
+    async with app.run_test(size=SIZE) as pilot:
+        assert (app._gpsd.host, app._gpsd.port) == ("clihost", "4000")
+        await pilot.press("u")  # saves the config...
+        await pilot.press("s")
+        await pilot.pause()
+        assert app.screen.query_one("#input-host", Input).value == "clihost"
+        app.screen.query_one("#btn-apply", Button).press()  # ...host/port unchanged
+        await pilot.pause()
+    saved = config_mod.load()
+    assert (saved.host, saved.port) == ("cfghost", 3001)
+    assert saved.units == "imperial"
+
+
+async def test_config_server_is_used_without_override(config_file):
+    config_mod.save(Config(host="cfghost", port=3001))
+    app = TuiGPS()
+    assert (app._gpsd.host, app._gpsd.port) == ("cfghost", "3001")
+
+
+# ─── Settings validation and the constellation display filter ─────────
+
+
+async def _open_settings(pilot, app):
+    await pilot.press("s")
+    await pilot.pause()
+    assert isinstance(app.screen, SettingsScreen)
+    return app.screen
+
+
+@pytest.mark.parametrize(
+    "field, value, message",
+    [
+        ("#input-port", "99999", "out of range"),
+        ("#input-port", "abc", "invalid port"),
+        ("#input-port", "", "invalid port"),
+        ("#input-host", "", "host is empty"),
+        ("#input-host", "my host", "must not contain spaces"),
+    ],
+)
+async def test_settings_invalid_server_shows_error_and_refuses_apply(
+    field, value, message, config_file
+):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        apply_btn = screen.query_one("#btn-apply", Button)
+        assert not apply_btn.disabled
+        assert not any(lbl.display for lbl in screen.query(".field-error"))
+        screen.query_one(field, Input).value = value
+        await pilot.pause()
+        name = "port" if "port" in field else "host"
+        error = screen.query_one(f"#error-{name}")
+        assert error.display and message in str(error.render())
+        assert apply_btn.disabled
+        # Enter in a field (or a forced apply) is refused too
+        screen.query_one(field, Input).focus()
+        await pilot.press("enter")
+        await pilot.pause()
+        screen._apply()
+        await pilot.pause()
+        assert isinstance(app.screen, SettingsScreen)
+        # Fixing the value clears the error
+        screen.query_one(field, Input).value = "2948" if name == "port" else "gpsbox"
+        await pilot.pause()
+        assert not error.display and not apply_btn.disabled
+        await pilot.press("escape")
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+    assert not config_file.exists()  # nothing was applied or saved
+
+
+async def test_settings_log_dir_validation(tmp_path, config_file):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        log_dir = screen.query_one("#input-log-dir", Input)
+        for bad in (str(blocker), str(blocker / "sub"), "  "):
+            log_dir.value = bad
+            await pilot.pause()
+            assert screen.query_one("#error-log-dir").display
+            assert screen.query_one("#btn-apply", Button).disabled
+        log_dir.value = str(tmp_path / "new" / "logs")  # can be created
+        await pilot.pause()
+        assert not screen.query_one("#error-log-dir").display
+        assert not screen.query_one("#btn-apply", Button).disabled
+
+
+async def test_settings_requires_a_constellation(config_file):
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        for chk in screen.query("#gnss-checkboxes Checkbox"):
+            chk.value = False
+        await pilot.pause()
+        assert screen.query_one("#error-gnss").display
+        assert screen.query_one("#btn-apply", Button).disabled
+        screen.query_one("#chk-gnss-navic").value = True
+        await pilot.pause()
+        assert not screen.query_one("#btn-apply", Button).disabled
+
+
+async def test_settings_lists_all_constellations_as_display_filter():
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        label = str(screen.query_one("#gnss-label").render())
+        assert label.startswith("Show constellations")
+        keys = [c.id.removeprefix("chk-gnss-") for c in screen.query("#gnss-checkboxes Checkbox")]
+        assert keys == ["gps", "sbas", "galileo", "beidou", "imes", "qzss", "glonass", "navic"]
+        assert all(c.value for c in screen.query("#gnss-checkboxes Checkbox"))  # default: all
+
+
+async def test_settings_apply_persists_everything(tmp_path, config_file, make_gps_data):
+    log_dir = tmp_path / "logs"
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        app._gps_data = make_gps_data()
+        screen = await _open_settings(pilot, app)
+        screen.query_one("#select-units", Select).value = "imperial"
+        screen.query_one("#select-coord", Select).value = "dms"
+        screen.query_one("#select-log-format", Select).value = "csv"
+        screen.query_one("#input-log-dir", Input).value = str(log_dir)
+        screen.query_one("#chk-gnss-galileo").value = False
+        screen.query_one("#chk-gnss-glonass").value = False
+        port = screen.query_one("#input-port", Input)
+        port.value = " 2948 "
+        port.focus()
+        await pilot.press("enter")  # Enter in an Input applies
+        await pilot.pause()
+        assert not isinstance(app.screen, SettingsScreen)
+        assert app._gpsd.port == "2948"
+        assert app._hidden_gnss == frozenset({2, 6})
+        # The filter takes effect immediately on the visible widgets
+        assert "GA11" not in app.query_one("#w-signal").render().plain
+    saved = config_mod.load()
+    assert (saved.units, saved.coord_format) == ("imperial", "dms")
+    assert (saved.log_format, saved.log_dir) == ("csv", str(log_dir))
+    assert saved.display_gnss == ["gps", "sbas", "beidou", "imes", "qzss", "navic"]
+    assert saved.port == 2948 and saved.host is None  # only the changed field is saved
+    assert not log_dir.exists()  # created only when logging starts
+
+
+async def test_settings_open_with_saved_values(tmp_path, config_file):
+    config_mod.save(Config(log_format="csv", log_dir=str(tmp_path), display_gnss=["gps", "qzss"]))
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        screen = await _open_settings(pilot, app)
+        assert screen.query_one("#select-log-format", Select).value == "csv"
+        assert screen.query_one("#input-log-dir", Input).value == str(tmp_path)
+        checked = {c.id for c in screen.query("#gnss-checkboxes Checkbox") if c.value}
+        assert checked == {"chk-gnss-gps", "chk-gnss-qzss"}
+
+
+async def test_filter_from_config_applies_to_every_view(config_file, make_gps_data):
+    config_mod.save(Config(display_gnss=["gps"]))
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        data = make_gps_data()
+        app._gps_data = data
+        app._refresh_ui()
+        await pilot.pause()
+        signal = app.query_one("#w-signal").render().plain
+        assert "GP05" in signal and "GA11" not in signal and "GL08" not in signal
+        assert "hidden by filter" in signal
+        sky = app.query_one("#w-skyplot").render().plain
+        assert sky.count("#") == 2 and sky.count("o") == 1  # GP05, GP12 used; GP25 not
+        # Fix data and status bar are not filtered
+        assert "3 used / 7 vis" in app.query_one("#w-fix").render().plain
+        assert "2GP+1GA/7sv" in app.query_one("#w-connection").render().plain
+        app.query_one(TabbedContent).active = "tab-satellites"
+        await pilot.pause()
+        table = app.query_one("#w-sattable").render().plain
+        assert "GA " not in table and "GL " not in table and "GP " in table
+        assert "4 satellites hidden" in table
+        panel = app.query_one("#w-constellations").render().plain
+        assert "Galileo   1/1  (hidden)" in panel
+        assert "3 used / 7 visible" in panel
+        assert data.satellites_used == 3  # data itself is untouched
+
+
+# ─── Logging settings (U8) and units everywhere (F10) ─────────────────
+
+
+async def test_log_uses_configured_directory_and_format(tmp_path, config_file, make_gps_data):
+    log_dir = tmp_path / "gps" / "logs"
+    config_mod.save(Config(log_format="csv", log_dir=str(log_dir)))
+    notes = []
+    app = TuiGPS()
+    app.notify = lambda message, **kw: notes.append(message)
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("l")
+        assert app._gps_logger.is_active
+        path = app._gps_logger.filepath
+        assert path.parent == log_dir and path.suffix == ".csv"
+        assert notes[-1] == f"Logging (CSV) to {path}"  # the full path
+        await asyncio.to_thread(app._on_gpsd_update, make_gps_data())
+        await settle(pilot, app)
+        await pilot.press("l")
+    assert len(path.read_text().splitlines()) == 2  # header + one fix
+
+
+async def test_log_start_error_is_notified(tmp_path, config_file):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    config_mod.save(Config(log_dir=str(blocker)))
+    notes = []
+    app = TuiGPS()
+    app.notify = lambda message, **kw: notes.append((message, kw.get("severity")))
+    async with app.run_test(size=SIZE) as pilot:
+        await pilot.press("l")
+        await pilot.pause()
+        assert app.is_running and not app._gps_logger.is_active
+        assert "REC" not in app.query_one("#w-connection").render().plain
+    assert notes[-1][1] == "error" and notes[-1][0].startswith("Cannot start logging")
+
+
+async def test_units_key_updates_every_panel(make_gps_data):
+    app = TuiGPS()
+    notes = []
+    app.notify = lambda message, **kw: notes.append(message)
+    async with app.run_test(size=SIZE) as pilot:
+        app._gps_data = make_gps_data()
+        app._refresh_ui()
+        await pilot.press("u")  # imperial
+        q = app.query_one
+        assert "Geoid:   -64.8 ft" in q("#w-position").render().plain
+        assert "49 ft/min" in q("#w-velocity").render().plain
+        assert "EPH: ±10.2 ft" in q("#w-errors").render().plain
+        await pilot.press("h")
+        app._hold.add_fix(47.0, -122.0, 10.0)
+        app._hold.add_fix(47.00001, -122.0, 11.0)
+        await pilot.press("h")
+    assert notes[-1].startswith("Hold stopped: 2 fixes, CEP50=") and notes[-1].endswith(" ft")
+
+
+async def test_timing_tab_labels_toff_source_end_to_end():
+    from tests.test_gpsd_client import TOFF_325, tpv
+
+    app = TuiGPS()
+    async with app.run_test(size=SIZE) as pilot:
+        client = GPSDClient()
+        client._on_update = app._on_gpsd_update
+        app.query_one(TabbedContent).active = "tab-timing"
+        await pilot.pause()
+        for t in ("2026-03-14T12:00:00Z", "2026-03-14T12:00:01Z"):
+            await asyncio.to_thread(client._handle_line, tpv(time=t))
+        await settle(pilot, app)
+        plain = app.query_one("#w-time-detail").render().plain
+        assert "(computed)" in plain
+        assert "Computed TOFF stats (TPV vs system clock)" in plain
+        await asyncio.to_thread(client._handle_line, TOFF_325)
+        await settle(pilot, app)
+        assert "(gpsd TOFF)" in app.query_one("#w-time-detail").render().plain
+
+
+def test_actions_before_mount_are_harmless(config_file):
+    """Key actions and refreshes that arrive before the UI exists do nothing."""
+    app = TuiGPS()
+    app.action_show_tab("tab-nmea")
+    app.action_cycle_theme()  # no theme list yet
+    app._refresh_ui()
+    assert app._theme_index == 0
+    assert not config_file.exists()  # nothing was saved
+
+
+def test_ui_guard_contains_widget_errors(caplog):
+    """One failing widget update is logged; a missing widget is expected and silent."""
+    from textual.css.query import NoMatches
+
+    app = TuiGPS()
+    with app._ui_guard("#gone"):
+        raise NoMatches("no #gone")
+    assert caplog.text == ""
+    with app._ui_guard("#broken"):
+        raise RuntimeError("render failed")
+    assert "UI update failed: #broken" in caplog.text and "render failed" in caplog.text

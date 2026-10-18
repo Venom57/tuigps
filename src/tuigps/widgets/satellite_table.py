@@ -6,10 +6,19 @@ import math
 
 from rich.style import Style
 from rich.text import Text
+from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..constants import GNSS_COLORS, GNSS_NAMES, GNSS_SHORT
 from ..data_model import GPSData
+
+
+# gpsd SKY satellite "health": (label, color)
+HEALTH: dict[int, tuple[str, str]] = {
+    0: ("---", "bright_black"),
+    1: ("OK", "green"),
+    2: ("BAD", "red"),
+}
 
 
 class SatelliteTable(Static):
@@ -22,11 +31,16 @@ class SatelliteTable(Static):
     }
     """
 
+    # gnssids hidden by the constellation display filter (changing it repaints)
+    hidden_gnss: reactive[frozenset[int]] = reactive(frozenset())
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._data: GPSData | None = None
 
     def update_gps_data(self, data: GPSData) -> None:
+        if data is self._data:
+            return  # same immutable snapshot: nothing new to draw
         self._data = data
         self.refresh()
 
@@ -35,7 +49,9 @@ class SatelliteTable(Static):
         txt.append("Satellite Details\n", style="bold")
 
         # Header
-        header = f"{'GNSS':<6} {'PRN':>4} {'SV':>3} {'El\u00b0':>5} {'Az\u00b0':>5} {'SNR':>5} {'Used':>5} {'Sig':>4} {'Hlth':>5}"
+        # No backslash escapes inside f-string expressions (SyntaxError before 3.12)
+        el, az = "El\u00b0", "Az\u00b0"
+        header = f"{'GNSS':<6} {'PRN':>4} {'SV':>3} {el:>5} {az:>5} {'SNR':>5} {'Used':>5} {'Sig':>4} {'Hlth':>5}"
         txt.append(header + "\n", style="bold bright_white")
         txt.append("\u2500" * len(header) + "\n", style="bright_black")
 
@@ -44,7 +60,12 @@ class SatelliteTable(Static):
             return txt
 
         # Sort by constellation, then by PRN
-        sats = sorted(self._data.satellites, key=lambda s: (s.gnssid, s.prn))
+        hidden = self.hidden_gnss
+        sats = sorted(
+            (s for s in self._data.satellites if s.gnssid not in hidden),
+            key=lambda s: (s.gnssid, s.prn),
+        )
+        n_hidden = len(self._data.satellites) - len(sats)
 
         for sat in sats:
             color = GNSS_COLORS.get(sat.gnssid, "white")
@@ -87,11 +108,16 @@ class SatelliteTable(Static):
             # Signal ID
             txt.append(f" {sat.sigid:>4}", style="bright_black")
 
-            # Health
-            health_str = "OK" if sat.health == 0 else f"{sat.health}"
-            health_color = "green" if sat.health == 0 else "red"
+            # Health (gpsd: 0 = unknown/not reported, 1 = OK, 2 = unhealthy)
+            health_str, health_color = HEALTH.get(sat.health, (str(sat.health), "red"))
             txt.append(f" {health_str:>5}", style=health_color)
 
             txt.append("\n")
 
+        if n_hidden:
+            txt.append(
+                f"  {n_hidden} satellite{'s' if n_hidden != 1 else ''} hidden by the "
+                "constellation filter (Settings)\n",
+                style="dim",
+            )
         return txt

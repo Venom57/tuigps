@@ -6,6 +6,7 @@ import math
 
 from rich.style import Style
 from rich.text import Text
+from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..constants import GNSS_COLORS, GNSS_SHORT
@@ -22,11 +23,16 @@ class SignalChart(Static):
     }
     """
 
+    # gnssids hidden by the constellation display filter (changing it repaints)
+    hidden_gnss: reactive[frozenset[int]] = reactive(frozenset())
+
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._data: GPSData | None = None
 
     def update_gps_data(self, data: GPSData) -> None:
+        if data is self._data:
+            return  # same immutable snapshot: nothing new to draw
         self._data = data
         self.refresh()
 
@@ -35,29 +41,33 @@ class SignalChart(Static):
         txt.append("Signal Strength (dBHz)\n", style="bold")
         txt.append("─" * 30 + "\n", style="bright_black")
 
-        if not self._data or not self._data.satellites:
+        hidden = self.hidden_gnss
+        all_sats = self._data.satellites if self._data else []
+        n_hidden = sum(1 for s in all_sats if s.gnssid in hidden)
+        if len(all_sats) == n_hidden:
             txt.append("  No satellites\n", style="dim")
+            if n_hidden:
+                txt.append(f"  ({n_hidden} hidden by filter)\n", style="dim")
             return txt
 
-        # Sort: used first, then by SNR descending
+        # Only satellites with a signal get a row, so only they count against
+        # the height budget. Sort: used first, then by SNR descending.
         sats = sorted(
-            self._data.satellites,
-            key=lambda s: (not s.used, -(s.snr if math.isfinite(s.snr) else 0)),
+            (s for s in all_sats
+             if s.gnssid not in hidden and math.isfinite(s.snr) and s.snr > 0),
+            key=lambda s: (not s.used, -s.snr),
         )
 
         max_snr = 55.0  # typical max dBHz for bar scaling
         bar_width = max(8, (self.size.width or 30) - 14)
         height_budget = (self.size.height or 20) - 3  # account for header lines
+        if n_hidden:
+            height_budget -= 1  # the "hidden by filter" line
 
         for i, sat in enumerate(sats):
             if i >= height_budget:
-                remaining = len(sats) - i
-                if remaining > 0:
-                    txt.append(f"  ... +{remaining} more\n", style="dim")
+                txt.append(f"  ... +{len(sats) - i} more\n", style="dim")
                 break
-
-            if not math.isfinite(sat.snr) or sat.snr <= 0:
-                continue
 
             prefix = GNSS_SHORT.get(sat.gnssid, "??")
             label = f"{prefix}{sat.svid:02d}"
@@ -76,11 +86,16 @@ class SignalChart(Static):
 
             txt.append(f" {int(sat.snr):2d}\n", style="white")
 
+        if n_hidden:
+            txt.append(f"  ({n_hidden} hidden by filter)\n", style="dim")
+
         # Legend
         txt.append("\n", style="")
         txt.append(" \u2022", style="white")
         txt.append("=Used  ", style="dim")
         for gnssid, color in sorted(GNSS_COLORS.items()):
+            if gnssid in hidden:
+                continue
             short = GNSS_SHORT.get(gnssid, "??")
             txt.append(f"\u2588{short} ", style=Style(color=color))
 

@@ -5,11 +5,12 @@ from __future__ import annotations
 import math
 
 from rich.text import Text
+from textual.reactive import reactive
 from textual.widgets import Static
 
 from ..constants import bearing_to_compass
 from ..data_model import GPSData
-from ..formatting import fmt, fmt_speed
+from ..formatting import fmt_climb, fmt_speed, trim
 
 
 class VelocityPanel(Static):
@@ -23,12 +24,16 @@ class VelocityPanel(Static):
     }
     """
 
+    units = reactive("metric")  # display setting: changing it repaints the panel
+
     def __init__(self, units: str = "metric", **kwargs):
         super().__init__(**kwargs)
         self._data: GPSData | None = None
         self.units = units
 
     def update_gps_data(self, data: GPSData) -> None:
+        if data is self._data:
+            return  # same immutable snapshot: nothing new to draw
         self._data = data
         self.refresh()
 
@@ -39,7 +44,7 @@ class VelocityPanel(Static):
 
         if not self._data:
             txt.append("  No data\n", style="dim")
-            return txt
+            return trim(txt)
 
         d = self._data
 
@@ -64,7 +69,7 @@ class VelocityPanel(Static):
 
         # Climb
         txt.append("  Climb:  ", style="bright_black")
-        txt.append(fmt(d.climb, ".2f", " m/s") + "\n")
+        txt.append(fmt_climb(d.climb, self.units) + "\n")
 
         # Magnetic variation
         txt.append("  MagVar: ", style="bright_black")
@@ -74,4 +79,4 @@ class VelocityPanel(Static):
         else:
             txt.append("---\n")
 
-        return txt
+        return trim(txt)

@@ -1,46 +1,119 @@
 # Timing
 
-The Timing tab provides detailed time and PPS (Pulse Per Second) information for precision timing applications.
+The Timing tab (`3`) has the time, PPS and TOFF details for precision timing
+work.
 
 ![Timing](screenshots/timing.png)
 
-## Panels
+*Screenshot from a real receiver without PPS. The TOFF offset line now also
+shows where the value came from, for example `(computed)`.*
 
-### Time & Timing
-Detailed timing information including:
+## Time & Timing
 
-- **Date/Time** — Current GPS date and time in UTC
-- **ept** — Estimated time error from the receiver
-- **Leap** — Current leap seconds offset between GPS time and UTC
+- **Date / Time**: the GPS time of the latest fix, in UTC.
+- **ept**: gpsd's estimated time error (µs, ms or s).
+- **Leap**: GPS–UTC leap seconds, when the receiver reports them.
 
-### PPS
-Pulse Per Second timing data (requires PPS to be enabled on the Device tab):
+## PPS
 
-- **Offset** — PPS offset between the GPS pulse and the system clock, displayed in nanoseconds, microseconds, or milliseconds depending on magnitude
-- **Quality** — Color-coded quality indicator based on PPS offset (Excellent < 1us, Good < 10us, Fair < 100us, Poor > 100us)
-- **Prec** — PPS precision (derived from the receiver's reported precision exponent)
-- **qErr** — Quantization error reported by the receiver
+Pulse-per-second data from gpsd's PPS reports. gpsd sends these only when it
+sees PPS edges itself, from a `/dev/pps*` device or the serial port's DCD
+line. The PPS output must be enabled on the receiver (Device tab →
+**Apply PPS**).
 
-If PPS is not enabled, a message directs you to the Device tab to enable it.
+- **Offset**: system clock vs the GPS second at the pulse (`real − clock`),
+  in ns, µs or ms.
+- **Quality**: from the offset. Excellent < 1 µs, Good < 10 µs,
+  Fair < 100 µs, Poor otherwise.
+- **Prec**: gpsd's precision for the PPS source (2^precision seconds).
+- **qErr**: the receiver's quantization error for the pulse, in ns (u-blox),
+  when reported.
 
-### TOFF
-Time offset data computed from the GPS time in TPV messages vs the system clock captured at message receipt. Shows current offset, and accumulated statistics (mean, std dev, min, max) over the last 20 samples.
+Without PPS reports, the section says "No PPS data (enable PPS on Device tab)".
 
-**Note:** The TOFF offset includes ~0.5-1s of serial latency (time for the receiver to serialize and transmit the NMEA/UBX data). This is expected and does not indicate clock error. For true clock accuracy measurement, use PPS.
+## TOFF
 
-### Armed Measurement
-Press **Arm TOFF** to trigger a single-shot measurement: the system waits for the next TPV message, captures `time.time()` immediately when it arrives, and compares it with the GPS time from that message. The result shows:
-- **Delta** — offset between GPS time and system time (includes serial latency)
-- **GPS** — the GPS timestamp from the message
-- **System** — the system timestamp at receipt
+TOFF is the offset between the GPS time and the system clock when the
+report carrying that time arrived (`GPS − system`). The source is shown
+after the offset:
 
-Press **Clear TOFF** to reset all TOFF history and armed results.
+| Label | Source |
+|-------|--------|
+| `(gpsd TOFF)` | a gpsd TOFF report. gpsd sends these with PPS-capable devices, and they measure the serial time message against the system clock at gpsd's end. |
+| `(computed)` | computed by tuigps: the time in each TPV report vs the system clock captured when the report was received. Works with any receiver. |
 
-### TDOP
-Time Dilution of Precision — a measure of how satellite geometry affects timing accuracy. Lower values indicate better timing geometry.
+A gpsd TOFF report takes precedence: computed values replace it only after
+gpsd has sent no TOFF report for 5 seconds.
 
-### Device
-Shows the connected GPS device path, driver, baud rate, update cycle, and gpsd version.
+**Computed TOFF stats (TPV vs system clock)** are the mean, standard
+deviation, minimum and maximum over the last 20 TPV reports. They are always
+computed from TPV reports, whatever the source of the Offset line, and need
+at least 2 samples.
 
-## Enabling PPS
-To see PPS data, navigate to the Device tab and use the Apply PPS button to configure the receiver's timepulse output. PPS data will then appear on this page automatically.
+A computed TOFF includes the time the receiver needs to compute, serialize
+and send the fix, plus gpsd's processing. That is typically tens to hundreds
+of milliseconds, depending on baud rate and message volume. This is
+transport latency, not clock error. Use PPS to measure clock accuracy.
+tuigps timestamps each report as soon as it is read from the socket, before
+any rendering, so a busy UI does not inflate the value.
+
+### Armed measurement
+
+**Arm TOFF** takes a single-shot measurement on the next TPV report that
+carries a GPS time. The button turns green while armed. Afterwards it shows
+the result, for example `Arm TOFF (delta: +189.3 ms)`, and the panel's
+**Armed Measurement** section lists:
+
+- **Delta**: GPS time minus system time at receipt
+- **GPS**: the GPS timestamp from the report
+- **System**: the system time at receipt
+
+**Clear TOFF** clears the TOFF history and the armed result.
+
+## TDOP
+
+Time dilution of precision: how much the satellite geometry degrades the
+time solution. Lower is better.
+
+## Device
+
+The receiver's device path, driver, baud rate, update cycle and the gpsd
+version, as on the Dashboard.
+
+## PPS clock sync requirements
+
+**Set Clock (PPS)** on the [Device](device.md) tab reads the kernel PPS
+device directly, so it needs more than gpsd's PPS reports:
+
+1. **A kernel PPS device.** `/dev/pps0` (tuigps uses the first `/dev/pps*`)
+   comes from `pps_gpio` (a GPIO pin, for example on a Raspberry Pi) or
+   `pps_ldisc` (the DCD line of a serial port; gpsd attaches it). Check with
+   `ls -l /dev/pps*`. If there is none, the action reports "no PPS device
+   found" with a hint.
+2. **Read permission on it.** PPS devices are usually `root`-only
+   (`crw------- root root`). Either run with enough privileges or grant your
+   group access with a udev rule, for example
+   `/etc/udev/rules.d/60-pps.rules`:
+   ```
+   KERNEL=="pps[0-9]*", GROUP="dialout", MODE="0660"
+   ```
+   Then run `sudo udevadm trigger` (or replug/reboot), and make sure your user
+   is in that group. Without access, or when no pulse arrives within 3
+   seconds, the action reports "PPS fetch failed … (timeout or permission
+   denied)" and leaves the clock alone.
+3. **Permission to set the time.** tuigps calls systemd-timedated over D-Bus
+   (`busctl … SetTime`), which polkit normally allows for the active local
+   desktop user. If that is refused, it falls back to `sudo -n date`, which
+   needs a passwordless sudoers rule, for example
+   `you ALL=(ALL) NOPASSWD: /usr/bin/date`. This fallback is only accurate
+   to about a second.
+4. **A current fix with low latency.** The latest fix's GPS time plus the
+   time elapsed since it was received tells tuigps which GPS second the pulse
+   marks. That estimate runs behind by the receiver's reporting latency (the
+   computed TOFF), so the latency must be well under half a second.
+   Otherwise the clock can be set a whole second off. The system clock
+   itself may be off by any amount.
+
+The pulse is timestamped by the kernel at the interrupt. Only the
+*relative* correction is applied, so the delay between the pulse and the
+`SetTime` call cancels out.
